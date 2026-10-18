@@ -64,8 +64,11 @@ Mid-drag overrides:
 | <kbd>Shift</kbd> | square (in `corner`) · lasso (anywhere else) |
 | <kbd>Alt</kbd> | ellipse |
 
-A lasso selection is alpha-masked to your stroke before it is sent, so Lens
-sees the circled subject rather than its bounding box.
+A lasso selection is masked to your stroke before it is sent, so Lens sees
+the circled subject rather than its bounding box. The crop is trimmed tight to
+the drawn area and everything outside the stroke stays **transparent** — set
+`KCIRCLE_CROP_BG=white` if you need a solid background instead. Shapes without
+a mask (`rect`, `corner`, `ellipse`) send their bounding box as plain RGB.
 
 ## Why two tabs
 
@@ -188,7 +191,9 @@ Environment:
 | --- | --- |
 | `KCIRCLE_TRANSLATE` | target language code, e.g. `de`, `fr` |
 | `KCIRCLE_LOG` | `debug` for verbose logging, or a log file path |
-| `KCIRCLE_BYPASS_WM` | `1` to add `BypassWindowManagerHint` to the overlay |
+| `KCIRCLE_CROP_BG` | `white` to flatten a lasso crop onto an opaque background; the default keeps it transparent |
+| `KCIRCLE_REPROBE` | `1` to re-run the QtWebEngine health check |
+| `KCIRCLE_NO_BYPASS_WM` | `1` to drop `BypassWindowManagerHint` from the capture overlay |
 
 Debug logging records the selection region, the crop size, how much of the
 upload the mask covers, and which file is sent to Google — enough to diagnose

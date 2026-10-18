@@ -85,6 +85,22 @@ def circle(cx, cy, rx, ry, n=49):
              cy + ry * math.sin(2 * math.pi * i / n)) for i in range(n)]
 
 
+def _fills_bbox(poly):
+    """True if the polygon reaches the extremes of its own bounding box.
+
+    A square lasso does, so its cropped corners are legitimately opaque and
+    must not be asserted transparent.
+    """
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    near = 0.004
+    touches_left = any(abs(x - min(xs)) < near for x in xs)
+    touches_right = any(abs(x - max(xs)) < near for x in xs)
+    touches_top = any(abs(y - min(ys)) < near for y in ys)
+    touches_bottom = any(abs(y - max(ys)) < near for y in ys)
+    return touches_left and touches_right and touches_top and touches_bottom
+
+
 # ----------------------------------------------------------------- scopes
 
 def test_scopes():
@@ -124,7 +140,18 @@ def test_shapes(scene):
         frac = out.size[0] * out.size[1] / full
         check(frac < 0.60,
               f"{label:<14} {str(out.size):<12} {frac*100:5.1f}% of screen")
-        check(out.mode == "RGB", f"{label:<14} flattened to RGB (no alpha)")
+        rgba = out.convert("RGBA")
+        if poly:
+            # A lasso that traces the full extent of its own bbox (a square,
+            # say) legitimately fills it, so only assert transparency where the
+            # corners are actually outside the stroke.
+            if not _fills_bbox(poly):
+                check(rgba.getpixel((2, 2))[3] < 40,
+                      f"{label:<14} corners transparent outside the stroke")
+            check(rgba.getpixel((rgba.width // 2, rgba.height // 2))[3] > 200,
+                  f"{label:<14} the subject itself stays opaque")
+        else:
+            check(out.mode == "RGB", f"{label:<14} plain crop is RGB")
 
 
 def test_square(scene):

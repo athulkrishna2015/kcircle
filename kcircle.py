@@ -501,18 +501,14 @@ def crop_region(shot_path: str, region: tuple, poly: list | None = None) -> str:
         ImageDraw.Draw(mask).polygon(pts, fill=255)
         mask = mask.filter(ImageFilter.GaussianBlur(1.2))
 
-        # Trim to what the lasso actually covered. Without this the upload is
-        # mostly empty pixels and Lens effectively falls back to a broad
-        # search instead of reasoning about the circled subject.
+        # Trim to what the lasso actually covered, so the upload is tight
+        # around the subject instead of its whole bounding box.
         bbox = mask.getbbox()
         if bbox and (bbox[2] - bbox[0] > 8 and bbox[3] - bbox[1] > 8):
             cut = cut.crop(bbox)
             mask = mask.crop(bbox)
             L("mask: %d points, trimmed to drawn area %s", len(pts), bbox)
 
-        # Flatten onto white. A PNG with transparency is composited by the
-        # uploader on an arbitrary background, which corrupts OCR; opaque
-        # white keeps the text readable.
         total = cut.size[0] * cut.size[1]
         covered = sum(1 for px in mask.getdata() if px > 128)
         L("mask: %d/%d px inside (%.0f%% of the upload)", covered, total,
@@ -522,19 +518,32 @@ def crop_region(shot_path: str, region: tuple, poly: list | None = None) -> str:
         elif covered > total * 0.97:
             L("mask covers everything - this will read as a plain rectangle")
 
-        white = Image.new("RGBA", cut.size, (255, 255, 255, 255))
+        # Keep real transparency by default: everything outside the stroke is
+        # left see-through rather than filled with an opaque colour. This used
+        # to flatten onto white, on the theory that a transparent PNG would be
+        # composited badly by the uploader - a theory that was never actually
+        # tested, and the real cause of the whole-screen bug turned out to be
+        # the visual tab uploading before the crop existed.
+        # KCIRCLE_CROP_BG=white flattens onto white if a solid background is
+        # ever needed.
+        bg = (os.environ.get("KCIRCLE_CROP_BG") or "transparent").lower()
         cut.putalpha(mask)
-        cut = Image.alpha_composite(white, cut).convert("RGB")
+        if bg in ("white", "#fff", "solid"):
+            base = Image.new("RGBA", cut.size, (255, 255, 255, 255))
+            cut = Image.alpha_composite(base, cut).convert("RGB")
+            L("crop: flattened onto opaque white (KCIRCLE_CROP_BG=white)")
+        else:
+            L("crop: transparent outside the lasso")
     elif poly is not None:
         L("mask: skipped, polygon had %d points (need 3+)", len(poly))
 
-    # Always hand Google an opaque RGB. An RGBA upload gets composited by the
-    # receiver on an arbitrary background, which corrupts OCR.
-    if cut.mode != "RGB":
-        cut = cut.convert("RGB")
+    if poly is None or len(poly) < 3:
+        # no mask means no transparency to preserve; ship a plain RGB crop
+        if cut.mode != "RGB":
+            cut = cut.convert("RGB")
 
     cut.save(out, "PNG")
-    L("crop saved: %s (%dx%d)", out, cut.size[0], cut.size[1])
+    L("crop saved: %s (%dx%d %s)", out, cut.size[0], cut.size[1], cut.mode)
     return out
 
 
