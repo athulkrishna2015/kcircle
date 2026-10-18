@@ -22,8 +22,8 @@ from PyQt6.QtCore import (
     QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QFont, QGuiApplication, QImage, QImageReader, QLinearGradient,
-    QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QRegion,
+    QBrush, QColor, QFont, QGuiApplication, QImage, QLinearGradient, QPainter,
+    QPainterPath, QPen, QPixmap, QRadialGradient, QRegion,
 )
 from PyQt6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QPushButton, QTabWidget, QVBoxLayout,
@@ -39,7 +39,6 @@ except Exception:                                    # noqa: BLE001
 
 # ----------------------------------------------------------------- config
 
-HOTKEY_HINT = "Meta+Shift+S"
 PANEL_W, PANEL_H = 460, 520
 MIN_PANEL_W, MIN_PANEL_H = 320, 260
 DARK = "#1c1b22"
@@ -51,8 +50,48 @@ MUTED = "#9a96a0"
 _tmpdir = None
 
 
-def log(msg):
-    print(f"[kcircle] {msg}", file=sys.stderr, flush=True)
+# ----------------------------------------------------------------- logging
+
+def _log_path():
+    d = os.path.expanduser("~/.config/kcircle")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "kcircle.log")
+
+
+def setup_logging(level="info"):
+    """File + stderr logging.
+
+    KCIRCLE_LOG=debug turns on verbose tracing; KCIRCLE_LOG=<path> overrides
+    the file. The log is trimmed to 512 KB so it cannot grow without bound.
+    """
+    import logging
+    from logging.handlers import RotatingFileHandler
+
+    lvl = getattr(logging, os.environ.get("KCIRCLE_LOG", level).upper(),
+                  logging.INFO)
+    root = logging.getLogger("kcircle")
+    root.setLevel(lvl)
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+                            "%H:%M:%S")
+    path = _log_path()
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 512 * 1024:
+            with open(path, "w"):
+                pass
+        fh = RotatingFileHandler(path, maxBytes=512 * 1024, backupCount=1)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    except Exception:                                # noqa: BLE001
+        pass
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(logging.Formatter("%(levelname)-7s %(message)s"))
+    root.addHandler(sh)
+    logg = logging.getLogger("kcircle")
+    logg.debug("logging initialised -> %s (%s)", path, lvl)
+    return logg
+
+
+logg = None
 
 
 # ----------------------------------------------------------------- capture
@@ -92,10 +131,14 @@ class SelectionOverlay(QWidget):
 
     def __init__(self, shot_path: str):
         super().__init__()
+        # NB: Qt.Tool is deliberately NOT used. On Wayland/KWin a Tool window
+        # is excluded from activation and raise_() is ignored, so the overlay
+        # maps but ends up behind whatever you were looking at. A plain
+        # frameless Window with StaysOnTopHint is the portable choice; on KWin
+        # BypassWindowManagerHint additionally skips stacking completely.
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setCursor(Qt.CursorShape.CrossCursor)
@@ -128,9 +171,20 @@ class SelectionOverlay(QWidget):
         hint.adjustSize()
         hint.move(24, 24)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
-        self.glow = GlowOverlay(self)
-        self.glow.show()
+        self.glow = GlowTrail()
+        self._glow_timer = QTimer(self)
+        self._glow_timer.timeout.connect(self._glow_tick)
         self._hint = hint
+
+    def _glow_tick(self):
+        self.glow.t = (self.glow.t + 0.022) % 1.0
+        self.update()
+
+    def resizeEvent(self, e):
+        hint = getattr(self, "_hint", None)
+        if hint is not None:
+            hint.adjustSize()
+        super().resizeEvent(e)
 
     # painting ---------------------------------------------------------
     def _effective_mode(self, ev=None):
@@ -164,7 +218,6 @@ class SelectionOverlay(QWidget):
         p.drawPixmap(self.rect(), self.shot)
         p.fillRect(self.rect(), QColor(0, 0, 0, 110))
 
-        mode = self._tmp_mode or self.mode
         shape = self._shape()
 
         if shape is not None:
@@ -172,6 +225,8 @@ class SelectionOverlay(QWidget):
             p.setClipPath(shape, Qt.ClipOperation.IntersectClip)
             p.drawPixmap(self.rect(), self.shot)
             p.restore()
+
+        self.glow.paint(p)
         p.end()
 
     def _shape(self):
@@ -212,7 +267,7 @@ class SelectionOverlay(QWidget):
         self.current = self.origin
         self.glow.spark = QPointF(e.position())
         self.glow.path = QPainterPath(QPointF(self.origin))
-        self.glow.start()
+        self._glow_timer.start(16)          # ~60fps
         self.update()
 
     def mouseMoveEvent(self, e):
@@ -224,7 +279,7 @@ class SelectionOverlay(QWidget):
             self.path.append(self.current)
             self.glow.path.lineTo(QPointF(self.current))
         else:
-            self.glow.path = self._shape()
+            self.glow.path = self._shape() or QPainterPath()
         self.update()
 
     def mouseReleaseEvent(self, e):
@@ -233,21 +288,30 @@ class SelectionOverlay(QWidget):
         self.current = e.position().toPoint()
         mode = self._tmp_mode or self.mode
         self._tmp_mode = None
-        self.glow.stop()
+        self._glow_timer.stop()
 
         if mode == "lasso":
             self.path.append(self.current)
             if len(self.path) < 4:
                 self._reset()
                 return
+            # close the loop explicitly so the mask is a filled shape even
+            # when the stroke never returns to where it started
+            if self.path[0] != self.path[-1]:
+                self.path.append(self.path[0])
+
             xs = [pt.x() for pt in self.path]
             ys = [pt.y() for pt in self.path]
             if max(xs) - min(xs) < 12 or max(ys) - min(ys) < 12:
                 self._reset()
                 return
-            poly = [(pt.x() / self.width(), pt.y() / self.height()) for pt in self.path]
+            poly = [(pt.x() / self.width(), pt.y() / self.height())
+                    for pt in self.path]
             rect = (min(xs) / self.width(), min(ys) / self.height(),
                     max(xs) / self.width(), max(ys) / self.height())
+            if logg:
+                logg.info("lasso: %d points, bbox %.3f,%.3f-%.3f,%.3f",
+                          len(poly), *rect)
             self._reset()
             self.picked.emit((rect, poly))
             return
@@ -265,8 +329,8 @@ class SelectionOverlay(QWidget):
         self.origin = self.current = None
         self.path = []
         self._square = False
-        self.glow.stop()
-        self.glow.path = QPainterPath()
+        self._glow_timer.stop()
+        self.glow.clear()
         self.update()
 
     def keyPressEvent(self, e):
@@ -307,15 +371,47 @@ def crop_region(shot_path: str, region: tuple, poly: list | None = None) -> str:
         raise RuntimeError("selection is empty")
     cut = img.crop(box)
 
+    L = logg.debug if logg else (lambda *a, **k: None)
+    L("crop: screen=%dx%d region=%.3f,%.3f-%.3f,%.3f -> box=%s size=%dx%d "
+      "(%.0f%% of screen)", W, H, x1, y1, x2, y2, box,
+      box[2] - box[0], box[3] - box[1],
+      100.0 * (box[2] - box[0]) * (box[3] - box[1]) / float(W * H))
+
     if poly and len(poly) >= 3:
         pts = [(int(nx * W) - box[0], int(ny * H) - box[1]) for nx, ny in poly]
         mask = Image.new("L", cut.size, 0)
         ImageDraw.Draw(mask).polygon(pts, fill=255)
         mask = mask.filter(ImageFilter.GaussianBlur(1.2))
-        r, g, b, a = cut.split()
-        cut.putalpha(Image.composite(a, Image.new("L", cut.size, 0), mask))
+
+        # Trim to what the lasso actually covered. Without this the upload is
+        # mostly empty pixels and Lens effectively falls back to a broad
+        # search instead of reasoning about the circled subject.
+        bbox = mask.getbbox()
+        if bbox and (bbox[2] - bbox[0] > 8 and bbox[3] - bbox[1] > 8):
+            cut = cut.crop(bbox)
+            mask = mask.crop(bbox)
+            L("mask: %d points, trimmed to drawn area %s", len(pts), bbox)
+
+        # Flatten onto white. A PNG with transparency is composited by the
+        # uploader on an arbitrary background, which corrupts OCR; opaque
+        # white keeps the text readable.
+        total = cut.size[0] * cut.size[1]
+        covered = sum(1 for px in mask.getdata() if px > 128)
+        L("mask: %d/%d px inside (%.0f%% of the upload)", covered, total,
+          100.0 * covered / float(total or 1))
+        if covered < total * 0.10:
+            L("mask covers almost nothing - the lasso is tiny or degenerate")
+        elif covered > total * 0.97:
+            L("mask covers everything - this will read as a plain rectangle")
+
+        white = Image.new("RGBA", cut.size, (255, 255, 255, 255))
+        cut.putalpha(mask)
+        cut = Image.alpha_composite(white, cut).convert("RGB")
+    elif poly is not None:
+        L("mask: skipped, polygon had %d points (need 3+)", len(poly))
 
     cut.save(out, "PNG")
+    L("crop saved: %s (%dx%d)", out, cut.size[0], cut.size[1])
     return out
 
 
@@ -361,36 +457,37 @@ def _upload_page(crop_path: str) -> str:
     instead of spawning a browser."""
     import base64
 
+    try:
+        from PIL import Image
+        with Image.open(crop_path) as im:
+            dims = f"{im.width}x{im.height}"
+    except Exception:                                # noqa: BLE001
+        dims = ""
+
     with open(crop_path, "rb") as fh:
-        b64 = base64.b64encode(fh.read()).decode()
+        raw = fh.read()
+    b64 = base64.b64encode(raw).decode()
 
     return f"""<!doctype html><meta charset=utf-8>
 <body style="background:#202124;color:#9aa0a6;font:13px sans-serif;
              display:flex;align-items:center;justify-content:center;height:100vh">
 <div>Uploading selection to Google Lens…</div>
-<form id=f method=POST enctype=multipart/form-data
+<form id=f method=POST enctype="multipart/form-data"
       action="https://lens.google.com/v3/upload">
-  <input name=processed_image_dimensions value="">
+  <input name=processed_image_dimensions value="{dims}">
 </form>
 <script>
 (function(){{
   var bin = atob("{b64}");
   var arr = new Uint8Array(bin.length);
   for (var i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+  // The real pixel dimensions matter to Lens; byte length does not.
   var file = new File([arr], "selection.png", {{type:"image/png"}});
-  var fd = new FormData();
-  fd.append("encoded_image", file);
-  fd.append("processed_image_dimensions", arr.length + "x" + arr.length);
-  var xhr = new XMLHttpRequest();
-  // Simpler and CORS-safe: build a real form and let the browser navigate.
   var f = document.getElementById('f');
   var fi = document.createElement('input');
   fi.type='file'; fi.name='encoded_image';
   var dt = new DataTransfer(); dt.items.add(file); fi.files = dt.files;
   f.appendChild(fi);
-  var di = document.createElement('input');
-  di.name='processed_image_dimensions'; di.value=arr.length+"x"+arr.length;
-  f.appendChild(di);
   HTMLFormElement.prototype.submit.call(f);
 }})();
 </script>"""
@@ -433,8 +530,27 @@ a, span, div, h3, h2, p, li {
   overflow-wrap: anywhere !important; word-break: break-word !important;
 }
 table { max-width: 100% !important; display: block !important; overflow-x: auto !important; }
+
+/* Google reserves tall empty slots for ads and "related" carousels.
+   Nothing is ever rendered into them at this width, so drop them. */
+div:empty, span:empty, p:empty, section:empty {
+  display: none !important;
+}
+/* collapse the usual vertical rhythm - a 460px panel cannot afford it */
+.MjjYud, .M8OgIe, .g, [data-ved], .egMi0, .lwZc0, .kCrYT > div {
+  padding-top: 2px !important; padding-bottom: 2px !important;
+  margin-top: 0 !important; margin-bottom: 0 !important;
+}
+/* the tab strip and its spacer */
+#tOpsSpacer, #center_col > div:not(#rso):not(#bres),
+.gb_v, #bres, [id^="e_"], #botstuff {
+  display: none !important;
+}
+/* the AI Overview card hugs its text instead of padding into a slab */
+[jsname], .WwrzSb, .lwZc0, .VwiC3b {
+  padding: 6px 8px !important; margin: 2px 0 !important;
+}
 @media (min-width: 900px) {
-  /* give the result column the whole viewport when the panel is widened */
   #center_col { padding-left: 8px !important; padding-right: 8px !important; }
 }
 """
@@ -514,42 +630,39 @@ def rounded_mask(w: int, h: int, radius: int) -> "QRegion":
     return QRegion(path.toFillPolygon().toPolygon())
 
 
-class GlowOverlay(QWidget):
+class GlowTrail:
     """The travelling light trail behind a Circle-to-Search stroke.
 
     A wide soft halo, a tighter mid glow, a bright core, and a spark that rides
     the cursor - the same read as Google's gesture.
+
+    This paints into a QPainter the caller already owns. It is deliberately
+    NOT a child widget: a full-size child would paint over the screenshot the
+    overlay is showing.
     """
 
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+    def __init__(self):
         self.path = QPainterPath()
         self.spark = QPointF()
         self.t = 0.0
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
 
-    def start(self):
-        self._timer.start(16)          # ~60fps
+    def clear(self):
+        self.path = QPainterPath()
+        self.t = 0.0
 
-    def stop(self):
-        self._timer.stop()
+    @property
+    def active(self):
+        return not self.path.isEmpty()
 
-    def _tick(self):
-        self.t = (self.t + 0.022) % 1.0
-        self.update()
-
-    def paintEvent(self, _):
+    def paint(self, p):
         if self.path.isEmpty():
             return
-        p = QPainter(self)
+        p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         length = self.path.length()
         if length <= 0:
-            p.end()
+            p.restore()
             return
         head = min(length, self.t * length)
 
@@ -605,7 +718,7 @@ class GlowOverlay(QWidget):
         core.setColorAt(1.0, QColor(255, 255, 255, 0))
         p.setBrush(QBrush(core))
         p.drawEllipse(self.spark, 8, 8)
-        p.end()
+        p.restore()
 
 
 class Shimmer(QWidget):
@@ -732,10 +845,10 @@ class ResultsPanel(QWidget):
     def __init__(self, shot_path: str, region: tuple, translate_to: str | None,
                  poly: list | None = None):
         super().__init__()
+        # see SelectionOverlay: no Qt.Tool, or the panel hides behind others
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -796,6 +909,7 @@ class ResultsPanel(QWidget):
         tp.addWidget(self.text, 1)
 
         row = QHBoxLayout()
+        row.setSpacing(6)
         self.copy_btn = QPushButton("Copy text")
         self.copy_btn.clicked.connect(self.copy_text)
         self.mode_btn = QPushButton()
@@ -809,7 +923,18 @@ class ResultsPanel(QWidget):
             "Hold Shift for lasso and Alt for ellipse mid-drag\n"
             "(in corner mode Shift means square instead)."
         )
-        for b in (self.copy_btn, self.mode_btn):
+        self._settings0 = load_settings()
+        self._mode = self._settings0.get("mode", "rect")
+        self._ua_mode = self._settings0.get("ua", "mobile")
+        self.ua_btn = QPushButton(f"UA: {self._ua_mode}")
+        self.ua_btn.clicked.connect(self.toggle_ua)
+        self.ua_btn.setToolTip(
+            "Which Google layout the results use.\n\n"
+            "mobile  - reflows to the panel width\n"
+            "desktop - richer result set, restyled to fit\n\n"
+            "Applies to the Visual matches tab."
+        )
+        for b in (self.copy_btn, self.mode_btn, self.ua_btn):
             b.setStyleSheet(
                 "QPushButton{background:#34313d; color:#e6e1e5;"
                 "border:none; border-radius:5px; padding:7px 11px;}"
@@ -817,8 +942,6 @@ class ResultsPanel(QWidget):
             )
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             row.addWidget(b)
-        self._settings0 = load_settings()
-        self._mode = self._settings0.get("mode", "rect")
         self._refresh_mode_btn()
         tp.addLayout(row)
         self.tabs.addTab(text_page, "Text")
@@ -829,37 +952,18 @@ class ResultsPanel(QWidget):
             web_page = QWidget()
             wp = QVBoxLayout(web_page)
             wp.setContentsMargins(0, 0, 0, 0)
-            self.web_status = QLabel("Loading Google Lens results...")
-            self.web_status.setStyleSheet(f"color:{MUTED}; padding:4px 6px;")
-            wp.addWidget(self.web_status)
             self.web = QWebEngineView()
-            # Mobile UA: Google serves its responsive layout, which is the one
-            # that actually reflows inside a small panel.
-            self._settings = load_settings()
-            self._ua_mode = self._settings.get("ua", "mobile")
             self.web.page().profile().setHttpUserAgent(
                 UA_PRESETS.get(self._ua_mode, MOBILE_UA))
             self.web.loadFinished.connect(self._on_web_loaded)
             wp.addWidget(self.web, 1)
-
-            ua_row = QHBoxLayout()
-            self.ua_btn = QPushButton(f"UA: {self._ua_mode}")
-            self.ua_btn.setToolTip(
-                "Switch the user agent Google sees.\n"
-                "mobile = reflowing layout, fits the panel\n"
-                "desktop = richer result set, needs width"
-            )
-            self.ua_btn.clicked.connect(self.toggle_ua)
-            self.ua_btn.setStyleSheet(
-                "QPushButton{background:#2a2830;color:#9a96a0;"
-                "border:1px solid #3a3742;border-radius:4px;padding:3px 8px;"
-                "font-size:11px;}"
-                "QPushButton:hover{background:#3a3742;color:#e6e1e5;}"
-            )
-            self.ua_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            ua_row.addWidget(self.ua_btn)
-            ua_row.addStretch(1)
-            wp.addLayout(ua_row)
+            # status floats over the view instead of stealing a layout row
+            self.web_status = QLabel("Loading Google Lens results...", self.web)
+            self.web_status.setStyleSheet(
+                f"color:{MUTED}; background:#232228cc; padding:3px 7px;"
+                "border-radius:4px; font-size:11px;")
+            self.web_status.move(6, 6)
+            self.web_status.raise_()
             self.tabs.addTab(web_page, "Visual matches")
         else:
             self.tabs.addTab(QLabel("PyQt6-WebEngine not installed"), "Visual matches")
@@ -877,7 +981,7 @@ class ResultsPanel(QWidget):
         self.grip.raise_()
 
         self.shimmer = Shimmer(self)
-        self.shimmer.setGeometry(14, 58, 260, 132)
+        self._place_shimmer()
         self.shimmer.show()
 
         self._ocr = ""
@@ -919,13 +1023,23 @@ class ResultsPanel(QWidget):
         except Exception:                            # noqa: BLE001
             pass
 
+    def _place_shimmer(self):
+        """Keep the loading placeholder inside the panel at any size."""
+        sh = getattr(self, "shimmer", None)
+        if sh is None:
+            return
+        w = max(160, min(self.width() - 40, 300))
+        h = max(96, min(self.height() - 200, 132))
+        sh.setGeometry(20, 60, w, h)
+
     def resizeEvent(self, e):
-        # resize() is called during __init__, before the grip exists
+        # resize() is called during __init__, before the grip/shimmer exist
         grip = getattr(self, "grip", None)
         if grip is not None:
             grip.move(self.width() - grip.width() - 4,
                       self.height() - grip.height() - 4)
             grip.raise_()
+        self._place_shimmer()
         self._apply_mask()
         super().resizeEvent(e)
 
@@ -953,6 +1067,9 @@ class ResultsPanel(QWidget):
         self.raise_()
 
     def on_result(self, r):
+        # the panel may have been closed while the request was in flight
+        if not hasattr(self, "shimmer"):
+            return
         self.shimmer.stop()
         self.shimmer.hide()
         crop = r.get("_crop") or self.shot_path
@@ -987,11 +1104,15 @@ class ResultsPanel(QWidget):
         self.status.setText(f"done · {r.get('detected_language') or 'unknown'}")
 
     def on_error(self, msg):
+        if not hasattr(self, "shimmer"):
+            return
         self.shimmer.stop()
         self.shimmer.hide()
         self.status.setText("Lens request failed")
         self.text.setText(msg)
-        self.browser_btn.setEnabled(False)
+        self.ua_btn.setEnabled(False)
+        if logg:
+            logg.error("lens request failed: %s", msg)
 
     def copy_text(self):
         from PyQt6.QtWidgets import QApplication
@@ -1010,6 +1131,9 @@ class ResultsPanel(QWidget):
     def cycle_mode(self):
         """Persist the selection style so the next launch starts with it."""
         order = ["corner", "lasso", "ellipse", "rect"]
+        # settings.json may hold a mode this build no longer knows
+        if self._mode not in order:
+            self._mode = order[0]
         self._mode = order[(order.index(self._mode) + 1) % len(order)]
         self._settings0["mode"] = self._mode
         save_settings(self._settings0)
@@ -1021,8 +1145,8 @@ class ResultsPanel(QWidget):
         if self.web is None:
             return
         self._ua_mode = "desktop" if self._ua_mode == "mobile" else "mobile"
-        self._settings["ua"] = self._ua_mode
-        save_settings(self._settings)
+        self._settings0["ua"] = self._ua_mode
+        save_settings(self._settings0)
 
         self.ua_btn.setText(f"UA: {self._ua_mode}")
         self.web.page().profile().setHttpUserAgent(UA_PRESETS[self._ua_mode])
@@ -1038,22 +1162,37 @@ class ResultsPanel(QWidget):
         if self.web is None:
             return
         self.web_status.setText("Google Lens results" if ok else "load failed")
-        self._reflow()
+        self._apply_reflow()
+        self._schedule_reflow()
 
-    def _reflow(self):
-        """Apply the CSS now and again while results stream in."""
+    def _apply_reflow(self):
+        """Inject the CSS. Safe to call repeatedly - it replaces its own tag."""
         if self.web is None:
             return
         self.web.page().runJavaScript(_responsive_script())
 
-        if not getattr(self, "_reflow_timers", None):
-            self._reflow_timers = []
-        for delay in (700, 1600, 3000):
+    def _schedule_reflow(self):
+        """Re-apply a few times as results hydrate in.
+
+        Only _on_web_loaded may call this. The timers must not call back into
+        it, or every tick would spawn three more and the panel would lock up
+        within seconds.
+        """
+        if self.web is None:
+            return
+        self._cancel_reflow()
+        self._reflow_timers = []
+        for delay in (600, 1400, 2600):
             t = QTimer(self)
             t.setSingleShot(True)
-            t.timeout.connect(self._reflow)
+            t.timeout.connect(self._apply_reflow)
             t.start(delay)
             self._reflow_timers.append(t)
+
+    def _cancel_reflow(self):
+        for t in getattr(self, "_reflow_timers", None) or []:
+            t.stop()
+        self._reflow_timers = []
 
     def _on_tab(self, idx):
         """Only pay for the embedded engine when the user asks for it."""
@@ -1081,6 +1220,16 @@ class ResultsPanel(QWidget):
             self.close()
 
     def closeEvent(self, e):
+        self._cancel_reflow()
+        self.shimmer.stop()
+        # the Lens request may still be in flight; a queued signal would then
+        # hit a deleted C++ object and abort the process
+        w = getattr(self, "worker", None)
+        if w is not None and w.isRunning():
+            w.finished.connect(w.deleteLater)
+            w.quit()
+            w.wait(1500)
+            self.worker = None
         self._save_geometry()
         self.finished.emit()
         super().closeEvent(e)
@@ -1089,7 +1238,11 @@ class ResultsPanel(QWidget):
 # ----------------------------------------------------------------- main
 
 def main():
+    global logg
+    logg = setup_logging()
     translate_to = os.environ.get("KCIRCLE_TRANSLATE") or None
+    logg.info("kcircle start (translate=%s, settings=%s)",
+              translate_to or "off", load_settings())
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -1097,8 +1250,9 @@ def main():
     def begin():
         try:
             shot = capture()
+            logg.info("captured %s", shot)
         except Exception as exc:                     # noqa: BLE001
-            log(f"capture failed: {exc}")
+            logg.error("capture failed: %s", exc)
             QTimer.singleShot(200, app.quit)
             return
 
@@ -1107,20 +1261,33 @@ def main():
         def on_pick(selection):
             ov.close()
             region, poly = selection
+            logg.info("picked region=%.3f,%.3f-%.3f,%.3f poly=%s",
+                      *region, f"{len(poly)}pts" if poly else "none")
             panel = ResultsPanel(shot, region, translate_to, poly)
             app._panel = panel                     # keep a reference alive
             # one-shot tool: closing the results ends the process
             panel.finished.connect(app.quit)
 
         def on_cancel():
+            logg.info("cancelled by user")
             ov.close()
             app.quit()
 
         ov.picked.connect(on_pick)
         ov.cancelled.connect(on_cancel)
         ov.show()
-        ov.raise_()
-        ov.activateWindow()
+        if os.environ.get("KCIRCLE_BYPASS_WM") == "1":
+            # escape hatch if stacking still misbehaves on a given setup
+            ov.setWindowFlag(Qt.WindowType.BypassWindowManagerHint, True)
+            ov.show()
+        # raise/activate again once the event loop has settled - the first
+        # show() can land before the compositor has finished mapping
+        def _focus():
+            ov.raise_()
+            ov.activateWindow()
+            ov.update()
+        QTimer.singleShot(0, _focus)
+        QTimer.singleShot(180, _focus)
 
     QTimer.singleShot(60, begin)
     sys.exit(app.exec())
