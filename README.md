@@ -120,7 +120,7 @@ uv pip install -r requirements.txt
 | --- | --- |
 | `PyQt6` | overlay, panel, glow animation, masking |
 | `PyQt6-WebEngine` | renders the Google Lens results page |
-| `chrome-lens-py` | Lens endpoint client for OCR, translation, labels |
+| `chrome-lens-py` | Lens endpoint client for OCR and translation |
 
 `Pillow` comes in as a `chrome-lens-py` dependency and is what draws the lasso
 alpha mask. At runtime you also need `spectacle`, which ships with Plasma.
@@ -212,8 +212,8 @@ tail -f ~/.config/kcircle/kcircle.log
    collects the drag as a rectangle, ellipse or lasso path.
 3. The selection is cropped locally and, for a lasso, alpha-masked to the
    stroke, so **only the pixels you actually selected are transmitted**.
-4. The crop goes to `chrome-lens-py` for OCR, translation and object labels,
-   and separately to `lens.google.com/v3/upload` for the full search results.
+4. The crop goes to `chrome-lens-py` for OCR and translation, and separately
+   to `lens.google.com/v3/upload` for the full search results.
 5. Those results render in a `QWebEngineView`, page-zoomed to fit the panel.
 
 A note on moving the window: on Wayland a client cannot set its own toplevel

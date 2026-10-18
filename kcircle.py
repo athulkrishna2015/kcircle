@@ -6,30 +6,47 @@ Trigger -> screen freezes -> draw a box -> results appear in a small
 always-on-top panel. No browser is launched; Lens is queried over its
 native Protobuf endpoint via chrome-lens-py.
 
-  OCR text, translation and object labels render natively in the panel.
-  "Visual matches" is the one thing that opens a browser, since Lens
-  visual search is inherently a web product.
+  OCR text and translation render natively in the panel. "Visual matches"
+  is the one thing that opens a browser, since Lens visual search is
+  inherently a web product.
 """
 
 import asyncio
+import atexit
+import itertools
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 
-from PyQt6.QtCore import (
-    QPoint, QPointF, QRect, QRectF, QUrl, Qt, QThread, QTimer, pyqtSignal,
-)
+from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
-    QBrush, QColor, QFont, QGuiApplication, QImage, QKeySequence, QLinearGradient,
-    QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QRegion, QShortcut,
+    QBrush,
+    QColor,
+    QFont,
+    QGuiApplication,
+    QImage,
+    QKeySequence,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QRadialGradient,
+    QRegion,
+    QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QLineEdit, QPushButton, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtGui import QKeySequence
 
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -43,6 +60,7 @@ except Exception:                                    # noqa: BLE001
 
 PANEL_W, PANEL_H = 460, 520
 MIN_PANEL_W, MIN_PANEL_H = 320, 260
+MAX_PANEL_W, MAX_PANEL_H = 4000, 4000
 DARK = "#1c1b22"
 PANEL_BG = "#232228"
 FG = "#e6e1e5"
@@ -50,6 +68,29 @@ ACCENT = "#d78ce0"
 MUTED = "#9a96a0"
 
 _tmpdir = None
+_capture_seq = itertools.count(1)
+_crop_seq = itertools.count(1)
+
+
+def _config_dir() -> str:
+    """~/.config/kcircle, created on demand. Single source of truth so the
+    probe cache, settings, geometry and log never drift apart."""
+    d = os.path.expanduser("~/.config/kcircle")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _cleanup_tmpdir() -> None:
+    """Remove this run's scratch directory on exit.
+
+    Captures and crops are only ever needed for the life of the process, and
+    without this every launch would leave a kcircle-* directory in /tmp forever.
+    """
+    if _tmpdir:
+        shutil.rmtree(_tmpdir, ignore_errors=True)
+
+
+atexit.register(_cleanup_tmpdir)
 
 
 def _webengine_signature() -> str:
@@ -66,9 +107,7 @@ def _webengine_signature() -> str:
 
 
 def _probe_cache_path() -> str:
-    d = os.path.expanduser("~/.config/kcircle")
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, "webengine.json")
+    return os.path.join(_config_dir(), "webengine.json")
 
 
 def _cached_webengine_ok():
@@ -131,7 +170,7 @@ def webengine_is_healthy(force: bool = False) -> bool:
     ok = False
     try:
         r = subprocess.run([sys.executable, "-c", probe],
-                           capture_output=True, timeout=60)
+                           capture_output=True, timeout=60, check=False)
         ok = r.returncode == 0
         if not ok and logg:
             err = (r.stderr or b"").decode(errors="replace").strip().splitlines()
@@ -143,9 +182,7 @@ def webengine_is_healthy(force: bool = False) -> bool:
     return ok
 
 def _log_path():
-    d = os.path.expanduser("~/.config/kcircle")
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, "kcircle.log")
+    return os.path.join(_config_dir(), "kcircle.log")
 
 
 def setup_logging(level="info"):
@@ -161,6 +198,9 @@ def setup_logging(level="info"):
                   logging.INFO)
     root = logging.getLogger("kcircle")
     root.setLevel(lvl)
+    # idempotent: calling setup_logging twice must not double every line
+    for h in list(root.handlers):
+        root.removeHandler(h)
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s",
                             "%H:%M:%S")
     path = _log_path()
@@ -189,6 +229,16 @@ logg = None
 CAPTURE_SCOPES = ["select", "window", "screen"]
 
 
+def clamp_panel_size(w, h) -> tuple:
+    """Clamp a restored panel size into a sane range.
+
+    A corrupt or hand-edited geometry.json could otherwise resize the panel to
+    an unusable (or off-screen) size.
+    """
+    return (max(MIN_PANEL_W, min(int(w), MAX_PANEL_W)),
+            max(MIN_PANEL_H, min(int(h), MAX_PANEL_H)))
+
+
 def _virtual_desktop() -> QRect:
     """Geometry covering every screen, matching a full-desktop capture."""
     screens = QGuiApplication.screens()
@@ -198,6 +248,18 @@ def _virtual_desktop() -> QRect:
     for s in screens[1:]:
         rect = rect.united(s.geometry())
     return rect
+
+
+def _spectacle_env() -> dict:
+    """Environment for the spectacle child process.
+
+    spectacle is its own Qt application. If the caller's environment pins a Qt
+    platform (QT_QPA_PLATFORM=offscreen in tests, or a nested/minimal session),
+    the child inherits it and silently captures nothing while still exiting 0.
+    Strip the Qt platform selection so spectacle uses the real session.
+    """
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith("QT_QPA_PLATFORM")}
 
 
 def capture(scope: str = "select") -> str:
@@ -214,22 +276,40 @@ def capture(scope: str = "select") -> str:
     global _tmpdir
     if _tmpdir is None:
         _tmpdir = tempfile.mkdtemp(prefix="kcircle-")
-    path = os.path.join(_tmpdir, "screen.png")
+    # A fresh path per capture: reusing one filename means a cancelled
+    # re-capture silently overwrites the screenshot a restored panel still
+    # points at.
+    path = os.path.join(_tmpdir, f"screen-{next(_capture_seq)}.png")
 
-    if not shutil.which("spectacle"):
+    spectacle = shutil.which("spectacle")
+    if not spectacle:
         raise RuntimeError("spectacle not found - cannot capture the screen")
 
     flag = {"select": "-f", "window": "-a", "screen": "-f"}.get(scope, "-f")
-    subprocess.run(
-        ["spectacle", "-b", "-n", flag, "-o", path],
-        check=True, capture_output=True, timeout=30,
-    )
+    env = _spectacle_env()
+    last = "no output"
+    # spectacle occasionally returns before the file is flushed, so verify and
+    # try once more rather than surfacing a hard failure for a transient miss.
+    for _ in range(2):
+        try:
+            r = subprocess.run(
+                [spectacle, "-b", "-n", flag, "-o", path],
+                check=False, capture_output=True, timeout=30, env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            last = f"spectacle timed out after {exc.timeout:g}s"
+            continue
+        if r.returncode != 0:
+            last = (r.stderr or b"").decode(errors="replace").strip().splitlines()
+            last = last[-1] if last else f"exit {r.returncode}"
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            if logg:
+                logg.debug("captured scope=%s -> %s (%d bytes)",
+                           scope, path, os.path.getsize(path))
+            return path
+        last = last if r.returncode != 0 else "spectacle produced no file"
 
-    if not os.path.exists(path):
-        raise RuntimeError("capture produced no file")
-    if logg:
-        logg.debug("captured scope=%s -> %s", scope, path)
-    return path
+    raise RuntimeError(f"capture failed for scope={scope}: {last}")
 
 
 # ----------------------------------------------------------------- selection
@@ -281,14 +361,20 @@ class SelectionOverlay(QWidget):
             "ellipse": "ellipse",
         }.get(self.mode, "rectangle")
 
+        # Parented to the overlay: a parentless QLabel is a top-level window and
+        # would never be shown, so the hint silently never appeared before.
         hint = QLabel(
             f"{mode_label}  ·  Shift = square / lasso  ·  Alt = ellipse"
-            "  ·  Esc to cancel"
+            "  ·  Esc to cancel",
+            self,
         )
         hint.setStyleSheet("color:#ffffff; background:#000000aa; padding:6px 12px;")
         hint.setFont(QFont("", 11))
+        # never let the hint eat the click that starts a selection
+        hint.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         hint.adjustSize()
         hint.move(24, 24)
+        hint.raise_()
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.glow = GlowTrail()
         self._glow_timer = QTimer(self)
@@ -306,20 +392,20 @@ class SelectionOverlay(QWidget):
         super().resizeEvent(e)
 
     # painting ---------------------------------------------------------
-    def _effective_mode(self, ev=None):
-        """Held modifiers give a temporary override of the saved mode.
+    def _effective_mode(self, mods):
+        """Resolve the selection mode for a given modifier state.
 
-        Shift -> lasso, Alt -> ellipse. In corner mode Shift is left free so
-        it can mean "square" instead.
+        Held modifiers override the saved mode: Shift -> lasso, Alt -> ellipse.
+        In corner mode Shift is left free so it can mean "square" instead.
+
+        This is evaluated on every mouse event, not just on press, so the
+        documented mid-drag overrides actually take effect.
         """
-        if ev is not None:
-            mods = ev.modifiers()
-            base = self._tmp_mode or self.mode
-            if mods & Qt.KeyboardModifier.AltModifier:
-                return "ellipse"
-            if mods & Qt.KeyboardModifier.ShiftModifier and base != "corner":
-                return "lasso"
-        return self._tmp_mode or self.mode
+        if mods & Qt.KeyboardModifier.AltModifier:
+            return "ellipse"
+        if (mods & Qt.KeyboardModifier.ShiftModifier) and self.mode != "corner":
+            return "lasso"
+        return self.mode
 
     def _shape_rect(self):
         rect = QRect(self.origin, self.current).normalized()
@@ -349,8 +435,13 @@ class SelectionOverlay(QWidget):
         p.end()
 
     def _shape(self):
-        """Current selection as a QPainterPath, or None if nothing drawn."""
-        if self.mode == "lasso" or self._tmp_mode == "lasso":
+        """Current selection as a QPainterPath, or None if nothing drawn.
+
+        Uses the effective (modifier-aware) mode so an Alt-held override of a
+        saved lasso previews as an ellipse while the drag is in progress.
+        """
+        mode = self._tmp_mode or self.mode
+        if mode == "lasso":
             if len(self.path) < 3:
                 return None
             path = QPainterPath(QPointF(self.path[0]))
@@ -363,13 +454,11 @@ class SelectionOverlay(QWidget):
             return None
 
         rect = QRectF(self._shape_rect())
-        if self._tmp_mode == "ellipse":
-            path = QPainterPath()
-            path.addEllipse(rect)
-            return path
-
         path = QPainterPath()
-        path.addRect(rect)
+        if mode == "ellipse":
+            path.addEllipse(rect)
+        else:
+            path.addRect(rect)
         return path
 
     # input ------------------------------------------------------------
@@ -377,7 +466,7 @@ class SelectionOverlay(QWidget):
         if e.button() == Qt.MouseButton.RightButton:
             self.cancelled.emit()
             return
-        self._tmp_mode = self._effective_mode(e)
+        self._tmp_mode = self._effective_mode(e.modifiers())
         # Shift in corner/rect mode means "square"
         self._square = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
         if self._tmp_mode == "lasso":
@@ -391,12 +480,19 @@ class SelectionOverlay(QWidget):
     def mouseMoveEvent(self, e):
         if self.origin is None:
             return
+        # Re-resolve the mode on every move: the README promises Shift/Alt
+        # overrides mid-drag, and _tmp_mode was previously frozen at press.
+        self._tmp_mode = self._effective_mode(e.modifiers())
+        self._square = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
         self.current = e.position().toPoint()
         self.glow.spark = QPointF(e.position())
-        if (self._tmp_mode or self.mode) == "lasso":
+        if self._tmp_mode == "lasso":
+            if not self.path:
+                self.path = [self.origin]
             self.path.append(self.current)
             self.glow.path.lineTo(QPointF(self.current))
         else:
+            self.path = []
             self.glow.path = self._shape() or QPainterPath()
         self.update()
 
@@ -409,6 +505,8 @@ class SelectionOverlay(QWidget):
         self._glow_timer.stop()
 
         if mode == "lasso":
+            if not self.path:
+                self.path = [self.origin]
             self.path.append(self.current)
             if len(self.path) < 4:
                 self._reset()
@@ -447,6 +545,7 @@ class SelectionOverlay(QWidget):
         self.origin = self.current = None
         self.path = []
         self._square = False
+        self._tmp_mode = None
         self._glow_timer.stop()
         self.glow.clear()
         self.update()
@@ -471,8 +570,7 @@ def crop_region(shot_path: str, region: tuple, poly: list | None = None) -> str:
     global _tmpdir
     if _tmpdir is None:
         _tmpdir = tempfile.mkdtemp(prefix="kcircle-")
-    out = os.path.join(
-        _tmpdir, f"crop-{abs(hash((region, len(poly or ()))) ) % 10**8}.png")
+    out = os.path.join(_tmpdir, f"crop-{next(_crop_seq)}.png")
 
     try:
         from PIL import Image, ImageDraw, ImageFilter
@@ -504,13 +602,16 @@ def crop_region(shot_path: str, region: tuple, poly: list | None = None) -> str:
         # Trim to what the lasso actually covered, so the upload is tight
         # around the subject instead of its whole bounding box.
         bbox = mask.getbbox()
-        if bbox and (bbox[2] - bbox[0] > 8 and bbox[3] - bbox[1] > 8):
+        if bbox and bbox[2] - bbox[0] > 8 and bbox[3] - bbox[1] > 8:
             cut = cut.crop(bbox)
             mask = mask.crop(bbox)
             L("mask: %d points, trimmed to drawn area %s", len(pts), bbox)
 
         total = cut.size[0] * cut.size[1]
-        covered = sum(1 for px in mask.getdata() if px > 128)
+        # histogram()[i] is the count of pixels with value i; summing 129..255
+        # counts "inside the lasso" in C instead of a Python loop over every
+        # pixel of a possibly multi-megapixel crop.
+        covered = sum(mask.histogram()[129:])
         L("mask: %d/%d px inside (%.0f%% of the upload)", covered, total,
           100.0 * covered / float(total or 1))
         if covered < total * 0.10:
@@ -537,14 +638,19 @@ def crop_region(shot_path: str, region: tuple, poly: list | None = None) -> str:
     elif poly is not None:
         L("mask: skipped, polygon had %d points (need 3+)", len(poly))
 
-    if poly is None or len(poly) < 3:
+    if (poly is None or len(poly) < 3) and cut.mode != "RGB":
         # no mask means no transparency to preserve; ship a plain RGB crop
-        if cut.mode != "RGB":
-            cut = cut.convert("RGB")
+        cut = cut.convert("RGB")
 
     cut.save(out, "PNG")
     L("crop saved: %s (%dx%d %s)", out, cut.size[0], cut.size[1], cut.mode)
     return out
+
+
+# QThread objects that are still running. A QThread whose Python wrapper is
+# collected while its thread is alive aborts the process ("QThread: Destroyed
+# while thread is still running"), so keep a reference until finished fires.
+_ACTIVE_WORKERS = set()
 
 
 class LensWorker(QThread):
@@ -584,9 +690,15 @@ class LensWorker(QThread):
 
 
 def _upload_page(crop_path: str) -> str:
-    """A self-contained page that POSTs the crop to Lens and navigates to the
-    results. Same trick Chromium itself uses, so it runs in our embedded view
-    instead of spawning a browser."""
+    """Write a self-contained page that POSTs the crop to Lens, and return its
+    path. Same trick Chromium itself uses, so it runs in our embedded view
+    instead of spawning a browser.
+
+    The page is written to a file and loaded by URL rather than handed to
+    setHtml(). QtWebEngine cannot display setHtml() content larger than 2 MB,
+    and a full-screen crop base64-encodes well past that, which silently left
+    the Visual matches tab blank. A local file has no such limit.
+    """
     import base64
 
     try:
@@ -600,7 +712,7 @@ def _upload_page(crop_path: str) -> str:
         raw = fh.read()
     b64 = base64.b64encode(raw).decode()
 
-    return f"""<!doctype html><meta charset=utf-8>
+    page = f"""<!doctype html><meta charset=utf-8>
 <body style="background:#202124;color:#9aa0a6;font:13px sans-serif;
              display:flex;align-items:center;justify-content:center;height:100vh">
 <div>Uploading selection to Google Lens…</div>
@@ -623,6 +735,12 @@ def _upload_page(crop_path: str) -> str:
   HTMLFormElement.prototype.submit.call(f);
 }})();
 </script>"""
+
+    base, _ = os.path.splitext(crop_path)
+    out = base + ".upload.html"
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(page)
+    return out
 
 # Kept deliberately tiny.
 #
@@ -983,6 +1101,7 @@ class ResultsPanel(QWidget):
         self._poly = poly
         self._translate_to = translate_to
         self._started = False
+        self._closing = False
         self.worker = None
 
         outer = QVBoxLayout(self)
@@ -1192,6 +1311,10 @@ class ResultsPanel(QWidget):
                                  self._translate_to, self._poly)
         self.worker.done.connect(self.on_result)
         self.worker.failed.connect(self.on_error)
+        # Hold the thread until it finishes, even if this panel is destroyed
+        # first, so it can never be garbage-collected mid-run.
+        _ACTIVE_WORKERS.add(self.worker)
+        self.worker.finished.connect(lambda: _ACTIVE_WORKERS.discard(self.worker))
         self.worker.start()
         self.show()
         self.raise_()
@@ -1202,17 +1325,17 @@ class ResultsPanel(QWidget):
         self.setMask(rounded_mask(self.width(), self.height(), 14))
 
     def _cfg_path(self):
-        d = os.path.expanduser("~/.config/kcircle")
-        os.makedirs(d, exist_ok=True)
-        return os.path.join(d, "geometry.json")
+        return os.path.join(_config_dir(), "geometry.json")
 
     def _restore_geometry(self):
         import json
         try:
             with open(self._cfg_path()) as fh:
                 g = json.load(fh)
-            self.resize(int(g["w"]), int(g["h"]))
-            if "x" in g:
+            # Clamp: a corrupt or stale file must not resize us off-screen
+            w, h = clamp_panel_size(g.get("w", PANEL_W), g.get("h", PANEL_H))
+            self.resize(w, h)
+            if "x" in g and "y" in g:
                 self.move(int(g["x"]), int(g["y"]))
                 self._restored_pos = True
         except Exception:                            # noqa: BLE001
@@ -1286,9 +1409,6 @@ class ResultsPanel(QWidget):
                 logg.debug("zoom %.2f for a %dpx panel (column %dpx)",
                            zoom, width, GOOGLE_DESKTOP_COLUMN)
 
-    def moveEvent(self, e):
-        super().moveEvent(e)
-
     def place_near_cursor(self):
         """Honour a saved position; only auto-place on the first ever run."""
         scr = QGuiApplication.primaryScreen()
@@ -1311,7 +1431,7 @@ class ResultsPanel(QWidget):
 
     def on_result(self, r):
         # the panel may have been closed while the request was in flight
-        if not hasattr(self, "shimmer"):
+        if getattr(self, "_closing", False) or not hasattr(self, "shimmer"):
             return
         self.shimmer.stop()
         self.shimmer.hide()
@@ -1338,12 +1458,12 @@ class ResultsPanel(QWidget):
         if tr and tr != ocr:
             parts.append(f"— translated —\n{tr}")
 
-        objs = r.get("objects") or []
-        names = [o.get("name") for o in objs if isinstance(o, dict) and o.get("name")]
-        if names:
-            parts.append("— detected —\n" + ", ".join(dict.fromkeys(names)))
+        # chrome-lens-py returns detected objects as geometry/segmentation data
+        # with no human-readable label, so there is nothing to list here. (The
+        # old code looked for an "name" key that this client never emits, so
+        # that section could never render.)
 
-        self.text.setText("\n\n".join(parts) if parts else "No text or objects found here.")
+        self.text.setText("\n\n".join(parts) if parts else "No text found here.")
         self.status.setText(f"done · {r.get('detected_language') or 'unknown'}")
 
         # the selection crop now exists - the visual tab can finally load
@@ -1351,7 +1471,7 @@ class ResultsPanel(QWidget):
             self._load_results()
 
     def on_error(self, msg):
-        if not hasattr(self, "shimmer"):
+        if getattr(self, "_closing", False) or not hasattr(self, "shimmer"):
             return
         self.shimmer.stop()
         self.shimmer.hide()
@@ -1457,7 +1577,11 @@ class ResultsPanel(QWidget):
         self._reflow_timers = []
 
     def _url_go(self):
-        """Navigate the embedded view to whatever is typed in the bar."""
+        """Navigate the embedded view to whatever is typed in the bar.
+
+        Connected to both returnPressed and editingFinished, which both fire on
+        Enter; skip the second so a single Enter is not two navigations.
+        """
         if self.web is None:
             return
         text = self.url_bar.text().strip()
@@ -1466,6 +1590,8 @@ class ResultsPanel(QWidget):
         if not text.startswith(("http://", "https://")):
             text = "https://" + text
             self.url_bar.setText(text)
+        if text == self.web.url().toString():
+            return
         if logg:
             logg.info("url bar: navigating to %s", text)
         self.web.load(QUrl(text))
@@ -1522,36 +1648,26 @@ class ResultsPanel(QWidget):
         self._apply_zoom()
         if logg:
             logg.info("uploading selection: %s", self._crop)
-        self.web.setHtml(_upload_page(self._crop))
-
-    def open_browser(self):
-        """Last resort: hand the crop to the system browser."""
-        import webbrowser
-
-        from PyQt6.QtWidgets import QApplication
-        img = QImage(getattr(self, "_crop", self.shot_path))
-        if img.isNull():
-            self.footer.setText("Nothing to send")
-            return
-        QApplication.clipboard().setImage(img)
-        webbrowser.open("https://lens.google.com/")
-        self.footer.setText("Image copied — paste into Lens (Ctrl+V)")
+        # load from a file URL rather than setHtml: a full-screen crop exceeds
+        # QtWebEngine's 2 MB setHtml() limit and would render an empty tab
+        self.web.load(QUrl.fromLocalFile(_upload_page(self._crop)))
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
             self.close()
 
     def closeEvent(self, e):
+        self._closing = True
         self._cancel_reflow()
         self.shimmer.stop()
-        # the Lens request may still be in flight; a queued signal would then
-        # hit a deleted C++ object and abort the process
+        # The Lens request may still be in flight. quit() is a no-op here (the
+        # thread runs asyncio, not a Qt event loop), so wait briefly, and hand
+        # ownership to _ACTIVE_WORKERS regardless: dropping our reference while
+        # the thread still runs would abort the process.
         w = getattr(self, "worker", None)
         if w is not None and w.isRunning():
-            w.finished.connect(w.deleteLater)
-            w.quit()
             w.wait(1500)
-            self.worker = None
+        self.worker = None
         self._save_geometry()
         self.finished.emit()
         super().closeEvent(e)
@@ -1569,7 +1685,6 @@ def main():
                      "(likely a PyQt6/Qt patch mismatch). Disabling the "
                      "Visual matches tab; OCR and translation still work.")
         HAVE_WEBENGINE = False
-        QWebEngineView = None
 
     logg.info("kcircle start (translate=%s, webengine=%s, settings=%s)",
               translate_to or "off", HAVE_WEBENGINE, load_settings())
@@ -1580,6 +1695,10 @@ def main():
 
     def begin_capture():
         """Hide the panel, freeze the screen, wait for a selection."""
+        if state["overlay"] is not None:
+            # a selection is already in progress; don't stack overlays
+            state["overlay"].raise_()
+            return
         panel = state["panel"]
         if panel is not None:
             panel.hide()
@@ -1615,6 +1734,7 @@ def main():
         state["overlay"] = ov
 
         def on_pick(selection):
+            state["overlay"] = None
             ov.close()
             region, poly = selection
             logg.info("picked region=%.3f,%.3f-%.3f,%.3f poly=%s",
@@ -1622,6 +1742,7 @@ def main():
             show_panel(shot, region, poly)
 
         def on_cancel():
+            state["overlay"] = None
             logg.info("cancelled by user")
             ov.close()
             if state["panel"] is not None:

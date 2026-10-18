@@ -9,16 +9,15 @@ import math
 import os
 import sys
 
+from PIL import Image, ImageDraw
 from PyQt6.QtCore import QEvent, QPointF, Qt
-from PyQt6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPixmap
+from PyQt6.QtGui import QColor, QMouseEvent, QPixmap
 from PyQt6.QtWidgets import QApplication
 
 spec = importlib.util.spec_from_file_location("k", "kcircle.py")
 k = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(k)
 k.logg = k.setup_logging("error")
-
-from PIL import Image, ImageDraw
 
 OUT = os.environ.get("KCIRCLE_DOCS_DIR", "/tmp/kcircle-docs")
 os.makedirs(OUT, exist_ok=True)
@@ -97,7 +96,7 @@ def render_crops(src):
         ov.resize(W, H)
         ov.mode = mode.replace("+Shift", "")
         got = {}
-        ov.picked.connect(lambda s: got.__setitem__("s", s))
+        ov.picked.connect(lambda s, g=got: g.__setitem__("s", s))
         ov.mousePressEvent(ev(PRESS, pts[0], mods))
         for p in pts[1:]:
             ov.mouseMoveEvent(ev(MOVE, p))
@@ -150,7 +149,7 @@ def render_glow(src):
 
 
 def main():
-    app = QApplication([])
+    _app = QApplication([])
     src = scene()
     print(f"rendering docs from a {W}x{H} synthetic scene")
     render("lasso", circle(700, 425, 340), NONE, src, "overlay.png")

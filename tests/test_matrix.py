@@ -1,19 +1,24 @@
 #!/usr/bin/env python
 """Local test matrix for kcircle.
 
-Exercises every scope x shape x user-agent combination without touching the
-network, and asserts two invariants that have both broken in the past:
+Exercises every scope x shape x user-agent combination, plus the invariants
+that have broken in the past:
 
   1. a selection never uploads the whole screenshot
   2. the visual tab never uploads before the crop exists
+  3. the injected CSS never overrides Google's own result layout
+  4. mid-drag Shift/Alt overrides actually change the selection
+  5. the capture command is robust (unique paths, clean Qt environment)
 """
 import importlib.util
+import logging
 import math
 import os
+import shutil
 import sys
 import tempfile
 
-from PyQt6.QtCore import QEvent, QPointF, Qt
+from PyQt6.QtCore import QEvent, QPointF, Qt, QUrl
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QApplication
 
@@ -22,10 +27,11 @@ k = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(k)
 k.logg = k.setup_logging("error")
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw  # noqa: E402
 
 SCREEN = (1600, 900)
 SHIFT = Qt.KeyboardModifier.ShiftModifier
+ALT = Qt.KeyboardModifier.AltModifier
 NONE = Qt.KeyboardModifier.NoModifier
 PRESS, MOVE, RELEASE = (QEvent.Type.MouseButtonPress,
                        QEvent.Type.MouseMove,
@@ -52,7 +58,7 @@ def make_scene():
         d.line([(i, 0), (i, SCREEN[1])], fill=(28, 34, 46), width=2)
     d.rectangle([420, 250, 1180, 650], fill=(200, 60, 70))
     d.ellipse([520, 300, 900, 520], fill=(60, 200, 140))
-    path = "/tmp/opencode/_scene.png"
+    path = os.path.join(tempfile.gettempdir(), "_scene.png")
     im.save(path)
     return path
 
@@ -67,16 +73,28 @@ def ev(t, pos, mods=NONE):
     return QMouseEvent(t, QPointF(*pos), b, br, mods)
 
 
-def draw(mode, pts, mods=NONE, scene=None):
+def new_overlay(scene, mode):
+    """An overlay sized to the scene.
+
+    The real overlay covers the virtual desktop, which in a headless run is not
+    SCREEN; resizing makes the pixel geometry match the scene the coordinates
+    were chosen for.
+    """
     ov = k.SelectionOverlay(scene)
-    ov.show()
+    ov.resize(*SCREEN)
     ov.mode = mode
+    ov.show()
+    return ov
+
+
+def draw(mode, pts, mods=NONE, scene=None):
+    ov = new_overlay(scene, mode)
     got = {}
     ov.picked.connect(lambda s: got.__setitem__("s", s))
     ov.mousePressEvent(ev(PRESS, pts[0], mods))
     for p in pts[1:]:
-        ov.mouseMoveEvent(ev(MOVE, p))
-    ov.mouseReleaseEvent(ev(RELEASE, pts[-1]))
+        ov.mouseMoveEvent(ev(MOVE, p, mods))
+    ov.mouseReleaseEvent(ev(RELEASE, pts[-1], mods))
     return got.get("s")
 
 
@@ -105,6 +123,9 @@ def _fills_bbox(poly):
 
 def test_scopes():
     print("\n== capture scopes ==")
+    if not shutil.which("spectacle"):
+        check(True, "spectacle not installed - skipping live capture")
+        return
     for scope in k.CAPTURE_SCOPES:
         try:
             p = k.capture(scope)
@@ -112,6 +133,75 @@ def test_scopes():
             check(w > 0 and h > 0, f"scope={scope:<7} captured {w}x{h}")
         except Exception as exc:                     # noqa: BLE001
             check(False, f"scope={scope} raised {type(exc).__name__}: {exc}")
+
+
+def test_capture_hermetic():
+    print("\n== capture command (hermetic) ==")
+    d = tempfile.mkdtemp(prefix="kcircle-cap-")
+    saved = (k._tmpdir, k.subprocess.run, k.shutil.which)
+    k._tmpdir = d
+    k.shutil.which = lambda name: "/usr/bin/" + name
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((list(cmd), dict(kw.get("env") or {})))
+        out = cmd[cmd.index("-o") + 1]
+        with open(out, "wb") as fh:
+            fh.write(b"png")
+
+        class R:
+            returncode = 0
+            stderr = b""
+            stdout = b""
+        return R()
+
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    k.subprocess.run = fake_run
+    try:
+        p1 = k.capture("select")
+        p2 = k.capture("screen")
+        check(p1 != p2, "each capture gets a unique path")
+        check("QT_QPA_PLATFORM" not in calls[0][1],
+              "spectacle env drops QT_QPA_PLATFORM")
+        check("-f" in calls[0][0], "select scope captures the full screen (-f)")
+        check("-b" in calls[0][0] and "-n" in calls[0][0],
+              "spectacle runs in background without notifications")
+    finally:
+        k._tmpdir, k.subprocess.run, k.shutil.which = saved
+        os.environ.pop("QT_QPA_PLATFORM", None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_capture_retries():
+    print("\n== capture retry ==")
+    d = tempfile.mkdtemp(prefix="kcircle-cap-")
+    saved = (k._tmpdir, k.subprocess.run, k.shutil.which)
+    k._tmpdir = d
+    k.shutil.which = lambda name: "/usr/bin/" + name
+    attempts = {"n": 0}
+
+    def flaky_run(cmd, **kw):
+        attempts["n"] += 1
+
+        class R:
+            returncode = 0
+            stderr = b""
+            stdout = b""
+        if attempts["n"] == 1:
+            return R()                     # first attempt writes nothing
+        out = cmd[cmd.index("-o") + 1]
+        with open(out, "wb") as fh:
+            fh.write(b"png")
+        return R()
+
+    k.subprocess.run = flaky_run
+    try:
+        p = k.capture("window")
+        check(attempts["n"] == 2 and os.path.exists(p),
+              "a missing first attempt is retried before failing")
+    finally:
+        k._tmpdir, k.subprocess.run, k.shutil.which = saved
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # ----------------------------------------------------------------- shapes
@@ -139,7 +229,7 @@ def test_shapes(scene):
         out = Image.open(k.crop_region(scene, region, poly))
         frac = out.size[0] * out.size[1] / full
         check(frac < 0.60,
-              f"{label:<14} {str(out.size):<12} {frac*100:5.1f}% of screen")
+              f"{label:<14} {out.size!s:<12} {frac*100:5.1f}% of screen")
         rgba = out.convert("RGBA")
         if poly:
             # A lasso that traces the full extent of its own bbox (a square,
@@ -163,6 +253,57 @@ def test_square(scene):
     check(abs(w - h) < 2, f"Shift produced a square ({w:.0f}x{h:.0f})")
 
 
+def test_modifier_overrides(scene):
+    print("\n== mid-drag modifier overrides ==")
+
+    # Shift pressed *after* the drag started must switch rect -> lasso.
+    ov = new_overlay(scene, "rect")
+    got = {}
+    ov.picked.connect(lambda s: got.__setitem__("s", s))
+    ov.mousePressEvent(ev(PRESS, (400, 300), NONE))
+    ov.mouseMoveEvent(ev(MOVE, (560, 420), NONE))
+    ov.mouseMoveEvent(ev(MOVE, (720, 560), SHIFT))
+    check(ov._tmp_mode == "lasso", "Shift mid-drag switches to lasso")
+    ov.mouseMoveEvent(ev(MOVE, (900, 640), SHIFT))
+    check(ov._shape() is not None and not ov._shape().isEmpty(),
+          "lasso preview path exists mid-drag")
+    ov.mouseMoveEvent(ev(MOVE, (980, 700), SHIFT))
+    ov.mouseReleaseEvent(ev(RELEASE, (980, 700), SHIFT))
+    check(bool(got.get("s")) and got["s"][1] is not None,
+          "a mid-drag lasso emits a polygon, not a rectangle")
+
+    # Alt pressed mid-drag must turn a saved lasso into an ellipse.
+    ov = new_overlay(scene, "lasso")
+    got = {}
+    ov.picked.connect(lambda s: got.__setitem__("s", s))
+    ov.mousePressEvent(ev(PRESS, (400, 300), NONE))
+    ov.mouseMoveEvent(ev(MOVE, (700, 500), NONE))
+    ov.mouseMoveEvent(ev(MOVE, (800, 560), ALT))
+    check(ov._tmp_mode == "ellipse", "Alt mid-drag overrides a lasso to ellipse")
+    ov.mouseReleaseEvent(ev(RELEASE, (800, 560), ALT))
+    check(bool(got.get("s")) and got["s"][1] is None,
+          "Alt override releases an ellipse selection, not a polygon")
+
+    # Shift in corner mode means "square", not lasso.
+    ov = new_overlay(scene, "corner")
+    ov.mousePressEvent(ev(PRESS, (400, 300), NONE))
+    ov.mouseMoveEvent(ev(MOVE, (900, 560), SHIFT))
+    check(ov._tmp_mode == "corner" and ov._square,
+          "Shift in corner mode stays corner + square")
+    r = ov._shape_rect()
+    check(r.width() == r.height(), "held Shift keeps the drag square")
+
+
+def test_overlay_hint(scene):
+    print("\n== overlay hint ==")
+    ov = new_overlay(scene, "rect")
+    check(ov._hint.parent() is ov, "hint label is parented to the overlay")
+    check(not ov._hint.isWindow(), "hint is not a separate top-level window")
+    check(ov._hint.testAttribute(
+              Qt.WidgetAttribute.WA_TransparentForMouseEvents),
+          "hint does not intercept the selection click")
+
+
 # ----------------------------------------------------------------- UA
 
 def test_ua():
@@ -177,10 +318,11 @@ def test_ua():
 
 class FakeWeb:
     def __init__(self):
-        self.html = None
+        self.last = None
         self.ua = None
         self.zoom = 1.0
         self._width = 460
+        self._url = QUrl("about:blank")
 
     def width(self):
         return self._width
@@ -189,7 +331,14 @@ class FakeWeb:
         self._width = w
 
     def setHtml(self, h):
-        self.html = h
+        self.last = h
+
+    def load(self, url):
+        self.last = url
+        self._url = url
+
+    def url(self):
+        return self._url
 
     def setZoomFactor(self, z):
         self.zoom = z
@@ -200,11 +349,18 @@ class FakeWeb:
     def page(self):
         return self
 
+    def profile(self):
+        return self
+
+    def setHttpUserAgent(self, ua):
+        self.ua = ua
+
 
 class PanelStub:
     _crop_ready = k.ResultsPanel._crop_ready
     _load_results = k.ResultsPanel._load_results
     _apply_zoom = k.ResultsPanel._apply_zoom
+    _url_go = k.ResultsPanel._url_go
     cycle_scope = k.ResultsPanel.cycle_scope
     cycle_mode = k.ResultsPanel.cycle_mode
     _refresh_scope_btn = k.ResultsPanel._refresh_scope_btn
@@ -213,12 +369,16 @@ class PanelStub:
 
 def new_stub(crop, ua="desktop", scope="select", mode="rect", uploaded=None):
     t = PanelStub()
-    t.shot_path = "/tmp/opencode/_full.png"
+    t.shot_path = os.path.join(tempfile.gettempdir(), "_full.png")
     t._crop = crop
     t.web = FakeWeb()
     t._uploaded_crop = uploaded
     t.web_status = type("S", (), {"setText": lambda s, x: None})()
-    t.tabs = type("T", (), {"currentIndex": lambda s: 1})()
+    t.url_bar = type("B", (), {
+        "_t": "",
+        "text": lambda s: s._t,
+        "setText": lambda s, x: setattr(s, "_t", x),
+    })()
     t._settings0 = {"ua": ua, "mode": mode, "scope": scope}
     t._ua_mode, t._mode, t._scope = ua, mode, scope
     t.scope_btn = type("B", (), {"setText": lambda s, x: None})()
@@ -239,7 +399,7 @@ def test_upload_gate():
     t._crop = full
     check(not t._crop_ready, "_crop_ready is False while _crop == shot_path")
     t._load_results()
-    check(t.web.html is None,
+    check(t.web.last is None,
           "refuses to upload while _crop is still the full screenshot")
 
     crop = tempfile.mktemp(suffix=".png")
@@ -247,14 +407,48 @@ def test_upload_gate():
     t._crop = crop
     check(t._crop_ready, "_crop_ready once a real crop exists")
     t._load_results()
-    check(t.web.html is not None, "uploads once the real crop exists")
+    check(isinstance(t.web.last, QUrl) and t.web.last.isLocalFile(),
+          "uploads by loading a local file URL, not setHtml")
 
-    before = t.web.html
+    before = t.web.last
     t._load_results()
-    check(t.web.html is before, "does not re-POST the same crop on reflow")
+    check(t.web.last is before, "does not re-POST the same crop on reflow")
 
     t._load_results(force=True)
-    check(t.web.html is not before, "force=True re-uploads for a UA switch")
+    check(t.web.last is not before, "force=True re-uploads for a UA switch")
+
+
+def test_upload_page():
+    print("\n== upload page ==")
+    d = tempfile.mkdtemp(prefix="kcircle-up-")
+    crop = os.path.join(d, "crop-1.png")
+    Image.new("RGB", (400, 300), (9, 9, 9)).save(crop)
+    page = k._upload_page(crop)
+    check(os.path.exists(page) and page.endswith(".upload.html"),
+          "upload page is written to a file")
+    with open(page, encoding="utf-8") as fh:
+        html = fh.read()
+    check("https://lens.google.com/v3/upload" in html, "page posts to Lens")
+    check('value="400x300"' in html, "page carries the real pixel dimensions")
+    check("File(" in html and "encoded_image" in html,
+          "page builds the multipart file field")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_url_bar():
+    print("\n== url bar ==")
+    t = new_stub(None)
+    t.web._url = QUrl("https://example.com/")
+    t.url_bar.setText("https://example.com/")
+    t._url_go()
+    check(t.web.last is None, "an already-open URL is not reloaded")
+    t.url_bar.setText("example.org")
+    t._url_go()
+    check(isinstance(t.web.last, QUrl) and t.web._url.toString() == "https://example.org",
+          "a new bare host is loaded once, with https added")
+    t._url_go()                          # editingFinished fires again on Enter
+    check(t.web._url.toString() == "https://example.org",
+          "the second Enter/e editingFinished does not double-navigate")
 
 
 def test_zoom_fitting():
@@ -287,7 +481,6 @@ def test_settings_roundtrip():
                   f"scope={scope} round-trips")
         t = new_stub(None)
         t._settings0 = {}
-        t._scope = "select"
         t._scope = k.CAPTURE_SCOPES[0]
         t.cycle_scope()
         check(t._settings0.get("scope") == "window", "scope cycles and saves")
@@ -300,6 +493,33 @@ def test_settings_roundtrip():
               f"unknown mode recovered -> {t2._mode}")
     finally:
         k._settings_path = saved
+
+
+def test_geometry_clamp():
+    print("\n== geometry clamping ==")
+    check(k.clamp_panel_size(10, 10) == (k.MIN_PANEL_W, k.MIN_PANEL_H),
+          "a tiny stored size is clamped up")
+    check(k.clamp_panel_size(10 ** 9, 10 ** 9) == (k.MAX_PANEL_W, k.MAX_PANEL_H),
+          "an absurd stored size is clamped down")
+    check(k.clamp_panel_size(500, 600) == (500, 600),
+          "a valid stored size is preserved")
+
+
+def test_config_dir():
+    print("\n== config dir ==")
+    d = k._config_dir()
+    check(os.path.isdir(d) and d.endswith(os.path.join(".config", "kcircle")),
+          f"config dir resolves and exists ({d})")
+
+
+def test_logging_idempotent():
+    print("\n== logging ==")
+    root = logging.getLogger("kcircle")
+    before = len(root.handlers)
+    k.setup_logging("error")
+    k.setup_logging("error")
+    check(len(root.handlers) == before,
+          "setup_logging does not stack handlers")
 
 
 # ----------------------------------------------------------------- CSS
@@ -324,16 +544,25 @@ def test_css():
 
 
 def main():
-    app = QApplication([])
+    _app = QApplication([])
     scene = make_scene()
-    print(f"scene {SCREEN[0]}xSCREEN[1] with distinctive content")
+    print(f"scene {SCREEN[0]}x{SCREEN[1]} with distinctive content")
     test_scopes()
+    test_capture_hermetic()
+    test_capture_retries()
     test_shapes(scene)
     test_square(scene)
+    test_modifier_overrides(scene)
+    test_overlay_hint(scene)
     test_ua()
     test_upload_gate()
+    test_upload_page()
+    test_url_bar()
     test_zoom_fitting()
     test_settings_roundtrip()
+    test_geometry_clamp()
+    test_config_dir()
+    test_logging_idempotent()
     test_css()
     print(f"\n{checks - len(fails)}/{checks} checks passed")
     if fails:
