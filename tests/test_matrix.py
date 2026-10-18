@@ -356,6 +356,22 @@ class FakeWeb:
         self.ua = ua
 
 
+class FakePageSettings:
+    def __init__(self):
+        self.attributes = {}
+
+    def setAttribute(self, attribute, enabled):
+        self.attributes[attribute] = enabled
+
+
+class FakePage:
+    def __init__(self):
+        self._settings = FakePageSettings()
+
+    def settings(self):
+        return self._settings
+
+
 class PanelStub:
     _crop_ready = k.ResultsPanel._crop_ready
     _load_results = k.ResultsPanel._load_results
@@ -433,6 +449,19 @@ def test_upload_page():
     check("File(" in html and "encoded_image" in html,
           "page builds the multipart file field")
     shutil.rmtree(d, ignore_errors=True)
+
+
+def test_local_upload_remote_access():
+    print("\n== local Lens upload network access ==")
+    page = FakePage()
+    k._allow_local_lens_upload(page)
+    attrs = page.settings().attributes
+    remote = k.QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls
+    files = k.QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls
+    check(attrs.get(remote) is True,
+          "the file-based upload page may submit to remote Lens")
+    check(attrs.get(files) is False,
+          "the upload page cannot read arbitrary local files")
 
 
 def test_url_bar():
@@ -557,6 +586,7 @@ def main():
     test_ua()
     test_upload_gate()
     test_upload_page()
+    test_local_upload_remote_access()
     test_url_bar()
     test_zoom_fitting()
     test_settings_roundtrip()

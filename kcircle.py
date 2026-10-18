@@ -49,9 +49,11 @@ from PyQt6.QtWidgets import (
 )
 
 try:
+    from PyQt6.QtWebEngineCore import QWebEngineSettings
     from PyQt6.QtWebEngineWidgets import QWebEngineView
     HAVE_WEBENGINE = True
 except Exception:                                    # noqa: BLE001
+    QWebEngineSettings = None
     QWebEngineView = None
     HAVE_WEBENGINE = False
 
@@ -742,6 +744,24 @@ def _upload_page(crop_path: str) -> str:
         fh.write(page)
     return out
 
+
+def _allow_local_lens_upload(page) -> None:
+    """Allow the local upload document to POST to Lens.
+
+    Chromium blocks local-origin documents from accessing remote URLs by
+    default. The Visual tab is intentionally a file:// form that submits the
+    selected image to lens.google.com, so enable this narrowly on that page
+    rather than on the whole WebEngine profile. Do not enable local file URL
+    access: the upload document embeds its crop and needs no other local files.
+    """
+    settings = page.settings()
+    settings.setAttribute(
+        QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
+    )
+    settings.setAttribute(
+        QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, False
+    )
+
 # Kept deliberately tiny.
 #
 # This used to be ~70 lines of !important overrides forcing Google's desktop
@@ -1258,6 +1278,10 @@ class ResultsPanel(QWidget):
             wp = QVBoxLayout(web_page)
             wp.setContentsMargins(0, 0, 0, 0)
             self.web = QWebEngineView()
+            # The initial Lens upload page is file:// and must POST remotely.
+            # Keep this permission page-scoped; disabling local-file access
+            # prevents it from reading any other local URLs.
+            _allow_local_lens_upload(self.web.page())
             self.web.page().profile().setHttpUserAgent(
                 UA_PRESETS.get(self._ua_mode, MOBILE_UA))
             self.web.loadFinished.connect(self._on_web_loaded)
