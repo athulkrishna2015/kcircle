@@ -1,0 +1,22 @@
+# Maintainer: Athulkrishna <athulkrishnasv2015@gmail.com>
+pkgname=kcircle-bin
+_pkgname=kcircle
+pkgver=@@VER@@
+pkgrel=1
+pkgdesc="Circle to Search for KDE Plasma on Wayland (prebuilt)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/athulkrishna2015/kcircle"
+license=('MIT')
+depends=('python' 'python-pyqt6' 'qt6-webengine' 'spectacle')
+options=('!strip')
+source_x86_64=("kcircle-@@VER@@-linux-x86_64.tar.gz::https://github.com/athulkrishna2015/kcircle/releases/download/v@@VER@@/kcircle-@@VER@@-linux-x86_64.tar.gz")
+source_aarch64=("kcircle-@@VER@@-linux-aarch64.tar.gz::https://github.com/athulkrishna2015/kcircle/releases/download/v@@VER@@/kcircle-@@VER@@-linux-aarch64.tar.gz")
+sha256sums_x86_64=('@@X86@@')
+sha256sums_aarch64=('@@ARM@@')
+
+package() {
+  local _root="$srcdir/kcircle-@@VER@@-linux-$CARCH"
+  install -Dm755 "$_root/kcircle" "$pkgdir/usr/bin/kcircle"
+  install -Dm644 "$_root/kcircle.desktop" "$pkgdir/usr/share/applications/kcircle.desktop"
+  install -Dm644 "$_root/kcircle.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/kcircle.svg"
+}

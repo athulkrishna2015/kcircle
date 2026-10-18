@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tarball
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          name="kcircle-${ver}-linux-${{ matrix.arch }}"
+          mkdir -p "$name"
+          cp kcircle kcircle.py kcircle.desktop kcircle.svg LICENSE README.md requirements.txt pyproject.toml "$name"/
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" | awk '{print $1}' > "$name.tar.gz.sha256"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kcircle-${{ matrix.arch }}
+          path: kcircle-*-linux-${{ matrix.arch }}.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS.txt
+          generate_release_notes: true
+
+  aur:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Push to AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  StrictHostKeyChecking no\n' > ~/.ssh/config
+          git clone ssh://aur@aur.archlinux.org/kcircle-bin.git aur
+          cd aur
+          x86=$(grep -E "  kcircle-$ver-linux-x86_64\.tar\.gz$" ../artifacts/SHA256SUMS.txt | cut -d' ' -f1)
+          arm=$(grep -E "  kcircle-$ver-linux-aarch64\.tar\.gz$" ../artifacts/SHA256SUMS.txt | cut -d' ' -f1)
+          cp ../aur/PKGBUILD PKGBUILD
+          sed -i -e "s/@@VER@@/$ver/g" -e "s/@@X86@@/$x86/g" -e "s/@@ARM@@/$arm/g" PKGBUILD
+          makepkg --printsrcinfo > .SRCINFO
+          git add PKGBUILD .SRCINFO
+          git -c user.name="github-actions" -c user.email="actions@github.com" commit -m "Update to $ver-1" || true
+          git push
