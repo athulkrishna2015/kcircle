@@ -39,38 +39,6 @@ except Exception:                                    # noqa: BLE001
     HAVE_WEBENGINE = False
 
 
-def webengine_is_healthy() -> bool:
-    """Probe WebEngine in a subprocess.
-
-    Importing the bindings is not enough: constructing a QWebEngineView can
-    hard-abort the process (seen with Arch's python-pyqt6 6.11.0 against
-    qt6 6.11.2, where the bindings and the runtime are a patch apart). A
-    SIGABRT cannot be caught, so the only safe check is to try it out of
-    process and degrade to OCR-only if it dies.
-    """
-    if not HAVE_WEBENGINE:
-        return False
-    probe = (
-        "import sys;"
-        "from PyQt6.QtWidgets import QApplication;"
-        "from PyQt6.QtCore import QTimer;"
-        "from PyQt6.QtWebEngineWidgets import QWebEngineView;"
-        "app=QApplication(sys.argv[:1]);v=QWebEngineView();v.resize(400,300);"
-        "v.page().profile().setHttpUserAgent('probe');"
-        "v.setHtml('<html><body>probe</body></html>');"
-        "QTimer.singleShot(2500, app.quit);app.exec()"
-    )
-    try:
-        r = subprocess.run([sys.executable, "-c", probe],
-                           capture_output=True, timeout=60)
-        if r.returncode != 0 and logg:
-            err = (r.stderr or b"").decode(errors="replace").strip().splitlines()
-            logg.debug("webengine probe failed rc=%s: %s", r.returncode,
-                       err[-1] if err else "(no stderr)")
-        return r.returncode == 0
-    except Exception:                                # noqa: BLE001
-        return False
-
 # ----------------------------------------------------------------- config
 
 PANEL_W, PANEL_H = 460, 520
@@ -84,7 +52,95 @@ MUTED = "#9a96a0"
 _tmpdir = None
 
 
-# ----------------------------------------------------------------- logging
+def _webengine_signature() -> str:
+    """Identify the Qt/PyQt6 combination in use.
+
+    The probe verdict depends on these, so a change to any of them re-probes.
+    """
+    try:
+        from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR
+        qt, pyqt = QT_VERSION_STR, PYQT_VERSION_STR
+    except Exception:                                # noqa: BLE001
+        qt = pyqt = "?"
+    return f"py{sys.version_info.major}.{sys.version_info.minor}|qt{qt}|pyqt{pyqt}"
+
+
+def _probe_cache_path() -> str:
+    d = os.path.expanduser("~/.config/kcircle")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "webengine.json")
+
+
+def _cached_webengine_ok():
+    """Previous verdict, or None if unknown or stale."""
+    import json
+
+    try:
+        with open(_probe_cache_path()) as fh:
+            data = json.load(fh)
+        if data.get("sig") == _webengine_signature():
+            return bool(data.get("ok"))
+    except Exception:                                # noqa: BLE001
+        pass
+    return None
+
+
+def _cache_webengine(ok: bool) -> None:
+    import json
+
+    try:
+        with open(_probe_cache_path(), "w") as fh:
+            json.dump({"sig": _webengine_signature(), "ok": bool(ok)}, fh)
+    except Exception:                                # noqa: BLE001
+        pass
+
+
+def webengine_is_healthy(force: bool = False) -> bool:
+    """Probe WebEngine in a subprocess.
+
+    Importing the bindings is not enough: constructing a QWebEngineView can
+    hard-abort the process (seen with Arch's python-pyqt6 6.11.0 against
+    qt6 6.11.2, where the bindings and the runtime are a patch apart). A
+    SIGABRT cannot be caught, so the only safe check is to try it out of
+    process and degrade to OCR-only if it dies.
+
+    The verdict is cached against the Qt/PyQt6 versions. Booting QtWebEngine in
+    a subprocess costs ~3s, and whether it loads is a property of the
+    installed Qt rather than of this launch - so it is paid once, not every
+    time. KCIRCLE_REPROBE=1 forces a fresh check.
+    """
+    if not HAVE_WEBENGINE:
+        return False
+    if not force and os.environ.get("KCIRCLE_REPROBE") != "1":
+        cached = _cached_webengine_ok()
+        if cached is not None:
+            if logg:
+                logg.debug("webengine probe: cached verdict %s", cached)
+            return cached
+
+    probe = (
+        "import sys;"
+        "from PyQt6.QtWidgets import QApplication;"
+        "from PyQt6.QtCore import QTimer;"
+        "from PyQt6.QtWebEngineWidgets import QWebEngineView;"
+        "app=QApplication(sys.argv[:1]);v=QWebEngineView();v.resize(400,300);"
+        "v.page().profile().setHttpUserAgent('probe');"
+        "v.setHtml('<html><body>probe</body></html>');"
+        "QTimer.singleShot(900, app.quit);app.exec()"
+    )
+    ok = False
+    try:
+        r = subprocess.run([sys.executable, "-c", probe],
+                           capture_output=True, timeout=60)
+        ok = r.returncode == 0
+        if not ok and logg:
+            err = (r.stderr or b"").decode(errors="replace").strip().splitlines()
+            logg.debug("webengine probe failed rc=%s: %s", r.returncode,
+                       err[-1] if err else "(no stderr)")
+    except Exception:                                # noqa: BLE001
+        ok = False
+    _cache_webengine(ok)
+    return ok
 
 def _log_path():
     d = os.path.expanduser("~/.config/kcircle")
@@ -133,6 +189,17 @@ logg = None
 CAPTURE_SCOPES = ["select", "window", "screen"]
 
 
+def _virtual_desktop() -> QRect:
+    """Geometry covering every screen, matching a full-desktop capture."""
+    screens = QGuiApplication.screens()
+    if not screens:
+        return QRect(0, 0, 1920, 1080)
+    rect = QRect(screens[0].geometry())
+    for s in screens[1:]:
+        rect = rect.united(s.geometry())
+    return rect
+
+
 def capture(scope: str = "select") -> str:
     """Grab the screen. Returns a PNG path.
 
@@ -175,15 +242,17 @@ class SelectionOverlay(QWidget):
 
     def __init__(self, shot_path: str):
         super().__init__()
-        # NB: Qt.Tool is deliberately NOT used. On Wayland/KWin a Tool window
-        # is excluded from activation and raise_() is ignored, so the overlay
-        # maps but ends up behind whatever you were looking at. A plain
-        # frameless Window with StaysOnTopHint is the portable choice; on KWin
-        # BypassWindowManagerHint additionally skips stacking completely.
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-        )
+        # BypassWindowManagerHint by default. KWin keeps panels and docks on
+        # their own top layer, which a plain always-on-top window cannot rise
+        # above, so the real panel would show through the capture and the
+        # frozen image would not line up with what is on screen. A bypass
+        # surface is drawn above everything. Set KCIRCLE_NO_BYPASS_WM=1 to opt
+        # out if it misbehaves on a given setup.
+        flags = (Qt.WindowType.FramelessWindowHint
+                 | Qt.WindowType.WindowStaysOnTopHint)
+        if os.environ.get("KCIRCLE_NO_BYPASS_WM") != "1":
+            flags |= Qt.WindowType.BypassWindowManagerHint
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         # keyPressEvent only fires when the widget has focus, which a frameless
         # always-on-top window does not get for free on Wayland
@@ -199,8 +268,11 @@ class SelectionOverlay(QWidget):
         self._tmp_mode = None
         self._square = False
 
-        scr = QGuiApplication.primaryScreen()
-        self.setGeometry(scr.geometry())
+        # Cover the whole capture, not just the primary output. spectacle grabs the
+        # entire virtual desktop, so an overlay sized to a single screen would
+        # leave the rest of the capture unreachable and mis-map every
+        # coordinate on a second monitor.
+        self.setGeometry(_virtual_desktop())
 
         mode_label = {
             "rect": "rectangle",
@@ -1558,9 +1630,6 @@ def main():
         esc.setContext(Qt.ShortcutContext.ApplicationShortcut)
         esc.activated.connect(on_cancel)
         ov._esc_shortcut = esc
-        if os.environ.get("KCIRCLE_BYPASS_WM") == "1":
-            ov.setWindowFlag(Qt.WindowType.BypassWindowManagerHint, True)
-            ov.show()
 
         def _focus():
             ov.raise_()
