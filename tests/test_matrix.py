@@ -152,9 +152,23 @@ class FakeWeb:
     def __init__(self):
         self.html = None
         self.ua = None
+        self.zoom = 1.0
+        self._width = 460
+
+    def width(self):
+        return self._width
+
+    def setWidth(self, w):
+        self._width = w
 
     def setHtml(self, h):
         self.html = h
+
+    def setZoomFactor(self, z):
+        self.zoom = z
+
+    def zoomFactor(self):
+        return self.zoom
 
     def page(self):
         return self
@@ -163,6 +177,7 @@ class FakeWeb:
 class PanelStub:
     _crop_ready = k.ResultsPanel._crop_ready
     _load_results = k.ResultsPanel._load_results
+    _apply_zoom = k.ResultsPanel._apply_zoom
     cycle_scope = k.ResultsPanel.cycle_scope
     cycle_mode = k.ResultsPanel.cycle_mode
     _refresh_scope_btn = k.ResultsPanel._refresh_scope_btn
@@ -215,6 +230,22 @@ def test_upload_gate():
     check(t.web.html is not before, "force=True re-uploads for a UA switch")
 
 
+def test_zoom_fitting():
+    print("\n== page zoom does the wrapping ==")
+    col = k.GOOGLE_DESKTOP_COLUMN
+    for panel_w, expect in ((300, 300 / col), (460, 460 / col),
+                            (700, 1.0), (1200, 1.0)):
+        t = new_stub(None, ua="desktop")
+        t.web.setWidth(panel_w)
+        t._apply_zoom()
+        check(abs(t.web.zoom - max(0.4, min(1.0, expect))) < 0.01,
+              f"desktop @ {panel_w}px -> zoom {t.web.zoom:.2f}")
+    t = new_stub(None, ua="mobile")
+    t.web.setWidth(300)
+    t._apply_zoom()
+    check(t.web.zoom == 1.0, "mobile stays at zoom 1.0 (already fluid)")
+
+
 # ----------------------------------------------------------------- settings
 
 def test_settings_roundtrip():
@@ -250,10 +281,18 @@ def test_css():
     print("\n== responsive css ==")
     css = k._RESPONSIVE_CSS
     check(css.count("{") == css.count("}"), "braces balanced")
-    for needle in ("#center_col", "grid-template-columns", 'name="q"'):
-        check(needle in css, f"css targets {needle}")
+    check(len(css) < 600, f"css is minimal ({len(css)} chars)")
+    # these used to force-wrap live result containers and made them vanish
+    for banned in ("word-break", "grid-template", "overflow-wrap",
+                   "div:empty", "[data-ved]", "#center_col", "flex-direction"):
+        check(banned not in css, f"css does not override {banned}")
+    # page furniture is still hidden so it does not eat the panel
+    check('textarea[name="q"]' in css, "search box still hidden")
+    check("header" in css, "page header still hidden")
     js = k._responsive_script()
     check("kcircle-css" in js, "css injection is idempotent (tag id)")
+    check("old.remove" not in js,
+          "style tag updated in place, not removed and re-appended")
     check("viewport" in js, "viewport meta ensured")
 
 
@@ -266,6 +305,7 @@ def main():
     test_square(scene)
     test_ua()
     test_upload_gate()
+    test_zoom_fitting()
     test_settings_roundtrip()
     test_css()
     print(f"\n{checks - len(fails)}/{checks} checks passed")

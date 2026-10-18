@@ -19,14 +19,14 @@ import sys
 import tempfile
 
 from PyQt6.QtCore import (
-    QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, pyqtSignal,
+    QPoint, QPointF, QRect, QRectF, QUrl, Qt, QThread, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QFont, QGuiApplication, QImage, QKeySequence, QLinearGradient,
     QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QRegion, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QPushButton, QStackedWidget,
+    QApplication, QHBoxLayout, QLabel, QLineEdit, QPushButton, QStackedWidget,
     QVBoxLayout, QWidget,
 )
 from PyQt6.QtGui import QKeySequence
@@ -543,74 +543,26 @@ def _upload_page(crop_path: str) -> str:
 }})();
 </script>"""
 
-# Google ships a fixed-width desktop layout. These rules collapse it so the
-# results reflow to whatever width the panel currently is.
+# Kept deliberately tiny.
+#
+# This used to be ~70 lines of !important overrides forcing Google's desktop
+# results into a narrow panel: fixed-width flattening, grid-template rewrites,
+# flex-direction column on every [style*=flex], and word-break on every
+# element. All of it fought Google's own layout while the page was still
+# hydrating, and results would appear and then vanish seconds later.
+#
+# What is left only removes page furniture that is never a result - the
+# header and the search box. Results are not restyled or re-wrapped at all;
+# they lay out as Google intends at whatever width the panel is. Widen the
+# panel if desktop results look cramped.
 _RESPONSIVE_CSS = """
-html, body {
-  width: 100% !important; max-width: 100% !important;
-  overflow-x: hidden !important; margin: 0 !important;
-  padding: 0 !important;
-}
-/* Google's own chrome has no place in a 400px panel */
-header, [role="banner"], #topnav, #gnav, #tads, #bottomads,
-div#header, div#hdt, .navigation, .gnav-divider,
-form#searchform, #foot, #search_footer, #ABucketedSearch {
+header, [role="banner"], #topnav, #gnav, div#header, div#hdt,
+.navigation, #foot, #search_footer {
   display: none !important;
 }
-/* Desktop results are built for a fixed 652px column - flatten it */
-#center_col, #res, #rso, #main, #cnt, .g, .gs-row, [data-ved],
-#search, .M8OgIe, .Q5Qldc, .lEBKkf, .egMi0, [data-snf] {
-  margin: 0 !important; padding: 6px 8px !important;
-  max-width: 100% !important; width: 100% !important;
-  float: none !important; box-sizing: border-box !important;
-}
-/* The desktop visual-matches grid is the widest offender */
-[data-ved] div[style*="display:grid"],
-div[style*="grid-template-columns"] {
-  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)) !important;
-  gap: 6px !important; max-width: 100% !important; width: 100% !important;
-}
-/* Side-by-side splits cannot survive a narrow panel */
-[style*="flex"], .M8OgIe, .lEBKkf {
-  flex-direction: column !important; align-items: stretch !important;
-}
-img, video, iframe, svg {
-  max-width: 100% !important; height: auto !important;
-}
-a, span, div, h3, h2, p, li {
-  overflow-wrap: anywhere !important; word-break: break-word !important;
-}
-table { max-width: 100% !important; display: block !important; overflow-x: auto !important; }
-
-/* Google reserves tall empty slots for ads and "related" carousels. Only
-   target the known ad slots: a blanket div:empty rule is unsafe, because
-   results hydrate progressively into containers that are momentarily empty
-   and hiding those keeps them hidden once the content lands. */
-#tads, #bottomads, [id^="e_"], .commercial_unit_mobile,
-.gb_v, #bres, #botstuff {
+form[action="/search"], #search,
+textarea[name="q"], input[name="q"] {
   display: none !important;
-}
-/* collapse the usual vertical rhythm - a 460px panel cannot afford it */
-.MjjYud, .M8OgIe, .g, [data-ved], .egMi0, .lwZc0, .kCrYT > div {
-  padding-top: 2px !important; padding-bottom: 2px !important;
-  margin-top: 0 !important; margin-bottom: 0 !important;
-}
-/* The modern search box is a rounded pill built from textarea[name=q] inside
-   a form, not the old #searchform. Hiding it and its spacer is what stops it
-   eating a third of the panel height. */
-form[action="/search"], #search, .M8OgIe, .nDcEnd,
-textarea[name="q"], input[name="q"], textarea[aria-label*="earch"],
-div[role="search"], #APjFqb, .v7vKf, .lAUtv, .sb_form_c {
-  display: none !important;
-}
-/* the tab strip and its spacer */
-#tOpsSpacer, #center_col > div:not(#rso):not(#bres),
-.gb_v, #bres, [id^="e_"], #botstuff {
-  display: none !important;
-}
-/* the AI Overview card hugs its text instead of padding into a slab */
-[jsname], .WwrzSb, .lwZc0, .VwiC3b {
-  padding: 6px 8px !important; margin: 2px 0 !important;
 }
 """
 
@@ -625,6 +577,11 @@ DESKTOP_UA = (
 )
 
 UA_PRESETS = {"mobile": MOBILE_UA, "desktop": DESKTOP_UA}
+
+# Google lays desktop results out in a fixed-width column of roughly this
+# width. The panel is usually narrower, so the page is scaled down to fit and
+# Chromium does the wrapping natively, instead of us overriding its CSS.
+GOOGLE_DESKTOP_COLUMN = 652
 
 
 def _settings_path() -> str:
@@ -652,12 +609,11 @@ def save_settings(s: dict) -> None:
 
 
 def _responsive_script() -> str:
-    """Strip Google's chrome and force the document to fill the viewport.
+    """Install the (deliberately tiny) furniture-hiding stylesheet.
 
-    Idempotent, and updates the existing <style> in place rather than
-    removing and re-appending it: a full style-tag swap forces the page to
-    restyle from scratch, which during progressive result hydration blanks
-    content that has not finished rendering.
+    The tag is updated in place rather than removed and re-appended: swapping
+    it forces the page to restyle from scratch, which during Google's
+    progressive hydration blanks content that has not finished rendering.
     """
     return f"""
 (function(){{
@@ -988,7 +944,23 @@ class ResultsPanel(QWidget):
             b.setStyleSheet(tab_qss)
         head_row.addWidget(self.tab_text)
         head_row.addWidget(self.tab_visual)
-        head_row.addStretch(1)
+
+        # The current Lens result URL. Lens lands on a google.com/search
+        # page with a long ?vsrid= token - worth showing so it can be copied,
+        # edited, or opened in a real browser.
+        self.url_bar = QLineEdit()
+        self.url_bar.setPlaceholderText("results URL")
+        self.url_bar.setClearButtonEnabled(True)
+        self.url_bar.setFixedHeight(24)
+        self.url_bar.setStyleSheet(
+            f"QLineEdit{{background:#1b1a20; color:{MUTED};"
+            "border:1px solid #34313d; border-radius:5px;"
+            "padding:0 7px; font-size:11px;}"
+            f"QLineEdit:focus{{color:{FG}; border-color:#5a5470;}}"
+        )
+        self.url_bar.returnPressed.connect(self._url_go)
+        self.url_bar.editingFinished.connect(self._url_go)
+        head_row.addWidget(self.url_bar, 1)
 
         title = DragBar("Circle to Search")
         title.setStyleSheet(
@@ -1089,6 +1061,7 @@ class ResultsPanel(QWidget):
             self.web.page().profile().setHttpUserAgent(
                 UA_PRESETS.get(self._ua_mode, MOBILE_UA))
             self.web.loadFinished.connect(self._on_web_loaded)
+            self.web.urlChanged.connect(self._sync_url)
             wp.addWidget(self.web, 1)
             # status floats over the view instead of stealing a layout row
             self.web_status = QLabel("Loading Google Lens results...", self.web)
@@ -1201,14 +1174,36 @@ class ResultsPanel(QWidget):
         super().resizeEvent(e)
 
     def _resize_reflow(self):
-        """Debounced CSS re-apply after a resize."""
-        t = getattr(self, "_resize_timer", None)
-        if t is None:
-            t = QTimer(self)
-            t.setSingleShot(True)
-            t.timeout.connect(self._apply_reflow)
-            self._resize_timer = t
-        t.start(220)
+        """Re-fit the page and re-apply the tiny stylesheet after a resize."""
+        self._apply_zoom()
+        self._apply_reflow()
+
+    def _apply_zoom(self):
+        """Let the engine do the wrapping: zoom Google's fixed results column
+        down to the panel width.
+
+        Google lays desktop results out in a fixed ~652px column. Rather than
+        overriding that with CSS - which fought the page while it was still
+        hydrating and made results vanish - scale the page so the column fits,
+        and let Chromium reflow and re-wrap everything natively, exactly as a
+        browser zoom does. Mobile results are already fluid, so they are left
+        at 1.0.
+        """
+        if self.web is None:
+            return
+        if self._ua_mode != "desktop":
+            self.web.setZoomFactor(1.0)
+            return
+        width = max(1, self.web.width())
+        zoom = min(1.0, width / GOOGLE_DESKTOP_COLUMN)
+        zoom = max(0.40, zoom)
+        # snap to whole percent so we are not reflowing on every pixel
+        zoom = round(zoom * 100) / 100.0
+        if abs(self.web.zoomFactor() - zoom) > 0.005:
+            self.web.setZoomFactor(zoom)
+            if logg:
+                logg.debug("zoom %.2f for a %dpx panel (column %dpx)",
+                           zoom, width, GOOGLE_DESKTOP_COLUMN)
 
     def moveEvent(self, e):
         super().moveEvent(e)
@@ -1334,6 +1329,7 @@ class ResultsPanel(QWidget):
 
         self.ua_btn.setText(f"UA: {self._ua_mode}")
         self.web.page().profile().setHttpUserAgent(UA_PRESETS[self._ua_mode])
+        self._apply_zoom()
 
         # re-run the search with the new identity
         self._load_results(force=True)
@@ -1351,6 +1347,7 @@ class ResultsPanel(QWidget):
         if self.web is None:
             return
         self.web.page().runJavaScript(_responsive_script())
+        self._apply_zoom()
 
     def _schedule_reflow(self):
         """Re-apply a few times as results hydrate in.
@@ -1377,6 +1374,31 @@ class ResultsPanel(QWidget):
         for t in getattr(self, "_reflow_timers", None) or []:
             t.stop()
         self._reflow_timers = []
+
+    def _url_go(self):
+        """Navigate the embedded view to whatever is typed in the bar."""
+        if self.web is None:
+            return
+        text = self.url_bar.text().strip()
+        if not text:
+            return
+        if not text.startswith(("http://", "https://")):
+            text = "https://" + text
+            self.url_bar.setText(text)
+        if logg:
+            logg.info("url bar: navigating to %s", text)
+        self.web.load(QUrl(text))
+
+    def _sync_url(self, url=None):
+        """Mirror the view's address into the bar unless the user is editing."""
+        if self.web is None:
+            return
+        if self.url_bar.hasFocus():
+            return
+        u = url.toString() if url is not None else self.web.url().toString()
+        if u and u != "about:blank":
+            self.url_bar.setText(u)
+            self.url_bar.setCursorPosition(0)
 
     def _select_visual(self):
         """Switch to the Visual matches page and load it if we can."""
@@ -1416,6 +1438,7 @@ class ResultsPanel(QWidget):
             return
         self._uploaded_crop = self._crop
         self.web_status.setText("Contacting Google Lens...")
+        self._apply_zoom()
         if logg:
             logg.info("uploading selection: %s", self._crop)
         self.web.setHtml(_upload_page(self._crop))

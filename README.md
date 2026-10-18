@@ -73,14 +73,20 @@ Google serves a different layout per user agent, and the useful ones trade off:
 
 | UA | Result set | Layout |
 | --- | --- | --- |
-| `mobile` | often thin — Google tends to answer with location and local junk | reflows natively |
+| `mobile` | often thin — Google tends to answer with location and local junk | fluid |
 | `desktop` | **richer** — real AI Overview and visual matches | fixed ~652px column |
 
-kcircle ships `desktop` by default and injects CSS to reflow it to the panel
-width, including collapsing the desktop visual-matches grid into `auto-fill`
-columns and hiding Google's search box. That injection is re-applied whenever
-the panel is resized, so the layout tracks the window instead of staying
-stranded at the original column width.
+kcircle ships `desktop` and fits it to the panel using the browser's own page
+zoom: when the panel is narrower than Google's fixed column, the page is scaled
+down so the column fits, and **Chromium does all the wrapping and re-wrapping
+itself**. Resizing re-fits on the fly. This is deliberately the opposite of
+overriding Google's CSS — an earlier version carried ~70 lines of `!important`
+rules to force the layout, which fought the page while it was still loading and
+made results appear and then vanish. The only CSS kcircle injects now hides
+Google's own header and search box, which are never results.
+
+If desktop results look cramped, widen the panel — or switch to `mobile`, which
+reflows natively but often returns less.
 
 ## Install
 
@@ -153,8 +159,10 @@ uv pip install --upgrade -r requirements.txt
    move, grab the bottom-right corner to resize, `Esc` to close.
 4. Press `+` for another capture — the panel hides while you select.
 
-The four buttons along the bottom cycle **Shape**, **UA** and **Scope**, and
-copy text to the clipboard. `+` starts a new capture, `×` closes.
+The header carries `+`, the two tab buttons, a **URL bar** showing the current
+Lens result (selectable, copyable, and editable — type a URL and press Enter to
+navigate), and `×`. The buttons along the bottom cycle **Shape**, **UA** and
+**Scope**, and copy the OCR text to the clipboard. `Esc` closes.
 
 Bind a shortcut in *System Settings → Shortcuts → Custom Shortcuts*:
 
@@ -201,29 +209,84 @@ tail -f ~/.config/kcircle/kcircle.log
    stroke, so **only the pixels you actually selected are transmitted**.
 4. The crop goes to `chrome-lens-py` for OCR, translation and object labels,
    and separately to `lens.google.com/v3/upload` for the full search results.
-5. Those results render in a `QWebEngineView` with Google chrome stripped and
-   the layout collapsed to the panel width.
+5. Those results render in a `QWebEngineView`, page-zoomed to fit the panel.
 
 A note on moving the window: on Wayland a client cannot set its own toplevel
 position, so kcircle uses Qt's `startSystemMove()` and lets KWin drive the
 drag. Resizing uses a custom corner grip for the same reason.
 
+## Installing to your system
+
+To run it from the app launcher rather than a terminal, install it somewhere
+permanent and register a desktop entry.
+
+```bash
+# 1. put it where it will live
+mkdir -p ~/.local/share/kcircle
+git clone https://github.com/athulkrishna2015/kcircle.git \
+    ~/.local/share/kcircle/repo
+
+# 2. build the environment
+cd ~/.local/share/kcircle/repo
+uv venv
+uv pip install -r requirements.txt
+```
+
+Install the icon at every size the launcher wants:
+
+```bash
+cd ~/.local/share/kcircle/repo
+for s in 16 22 32 48 64 128 256; do
+  mkdir -p ~/.local/share/icons/hicolor/${s}x${s}/apps
+  rsvg-convert -w $s -h $s kcircle.svg \
+    -o ~/.local/share/icons/hicolor/${s}x${s}/apps/kcircle.png
+done
+mkdir -p ~/.local/share/icons/hicolor/scalable/apps
+cp kcircle.svg ~/.local/share/icons/hicolor/scalable/apps/
+gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor
+```
+
+Add the launcher entry — note the **absolute** path, since the launcher does
+not inherit your shell's `PATH`:
+
+```bash
+mkdir -p ~/.local/share/applications
+cat > ~/.local/share/applications/kcircle.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Circle to Search
+GenericName=Screen region search
+Comment=Draw around anything on screen and search it with Google Lens
+Exec=/home/YOU/.local/share/kcircle/repo/kcircle
+Icon=kcircle
+Terminal=false
+Categories=Utility;
+Keywords=circle;search;lens;ocr;translate;crop;screenshot;
+StartupNotify=true
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
+EOF
+update-desktop-database ~/.local/share/applications
+```
+
+Then bind a shortcut in *System Settings → Shortcuts → Custom Shortcuts*:
+
+```
+Command: /home/YOU/.local/share/kcircle/repo/kcircle
+```
+
+The `X-KDE-DBUS-Restricted-Interfaces` line is only needed if you later switch
+capture to KWin's own `org.kde.KWin.ScreenShot2` API; the default `spectacle`
+path does not require it.
+
 ## Tests
 
 A local matrix covers every scope, shape and user-agent combination, and
-asserts the two invariants that have broken in the past: a selection never
-uploads the whole screenshot, and the visual tab never uploads before the crop
-exists.
+asserts the invariants that have broken in the past: a selection never uploads
+the whole screenshot, the visual tab never uploads before the crop exists, and
+the stylesheet never overrides Google's result layout.
 
 ```bash
 .venv/bin/python tests/test_matrix.py
-```
-
-The documentation images are generated from a synthetic scene rather than a
-real screen, so they never leak whatever happens to be on your display:
-
-```bash
-.venv/bin/python tests/make_docs_images.py
 ```
 
 ## Credits and provenance
@@ -255,6 +318,10 @@ official feature does.
   or crashes (some distro Qt/PyQt6 combinations abort on load), kcircle detects
   that in a subprocess at startup and falls back to OCR-only rather than
   crashing.
+- **There are no screenshots in this repository, by design.** A screen capture
+  of the results panel leaked this machine's geolocation. `docs/` and all image
+  types are gitignored, and the image generator writes to `/tmp` — so a
+  screenshot of your own session can never be committed by accident.
 
 ## License
 
