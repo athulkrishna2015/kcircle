@@ -4,3 +4,9 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# never commit screen captures - they leak whatever is on screen
+docs/
+*.png
+*.jpg
+*.jpeg

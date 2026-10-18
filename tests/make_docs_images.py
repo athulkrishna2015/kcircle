@@ -20,7 +20,7 @@ k.logg = k.setup_logging("error")
 
 from PIL import Image, ImageDraw
 
-OUT = "docs"
+OUT = os.environ.get("KCIRCLE_DOCS_DIR", "/tmp/kcircle-docs")
 os.makedirs(OUT, exist_ok=True)
 W, H = 1400, 850
 

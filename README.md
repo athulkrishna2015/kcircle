@@ -12,47 +12,6 @@ kcircle brings the gesture to the whole desktop. Freeze the screen, draw around
 anything — a PDF, a video, a terminal, a photo on your desktop — and the
 results land in a compact always-on-top panel.
 
-## Screenshots
-
-The results panel, showing a live Google Lens search rendered in place:
-
-![kcircle results panel](docs/panel.png)
-
-The animated glow that follows your stroke while you draw:
-
-![the selection glow](docs/glow.png)
-
-The overlay while drawing — the screen dims, the selection is punched back to
-full brightness, and the glow trails your stroke:
-
-![the selection overlay](docs/overlay.png)
-
-`corner` mode with <kbd>Shift</kbd> held, constraining the drag to a square:
-
-![square selection](docs/overlay-square.png)
-
-What each shape actually sends to Google — note that only the lasso trims
-everything outside the stroke to white:
-
-![the crops that get uploaded](docs/crops.png)
-
-```
-╭─ kcircle ──────────────────────────────╮
-│   Circle to Search                     │  ← drag to move
-│ ┌────────┬───────────────┐             │
-│ │  Text  │ Visual matches│             │  ← image search is default
-│ ├────────┴───────────────┤             │
-│ │  AI Overview       🔊  │             │
-│ │  "The image shows    │             │  ← real Lens results
-│ │   an abstract 3D…"    │             │
-│ │  ┌────┐               │             │
-│ │  │All │Exact│Visual    │             │
-│ │  └────┘               │             │
-│ └───────────────────────┘             │
-│  [UA: desktop] [Shape: ◯ lasso]    ╲   │
-╰─ Esc close · drag to move ────────────╯
-```
-
 ## Features
 
 - **Works on any application.** Capture is compositor-level, not

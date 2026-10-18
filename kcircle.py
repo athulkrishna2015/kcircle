@@ -26,8 +26,8 @@ from PyQt6.QtGui import (
     QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QRegion, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QPushButton, QTabWidget, QVBoxLayout,
-    QWidget,
+    QApplication, QHBoxLayout, QLabel, QPushButton, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 from PyQt6.QtGui import QKeySequence
 
@@ -582,9 +582,12 @@ a, span, div, h3, h2, p, li {
 }
 table { max-width: 100% !important; display: block !important; overflow-x: auto !important; }
 
-/* Google reserves tall empty slots for ads and "related" carousels.
-   Nothing is ever rendered into them at this width, so drop them. */
-div:empty, span:empty, p:empty, section:empty {
+/* Google reserves tall empty slots for ads and "related" carousels. Only
+   target the known ad slots: a blanket div:empty rule is unsafe, because
+   results hydrate progressively into containers that are momentarily empty
+   and hiding those keeps them hidden once the content lands. */
+#tads, #bottomads, [id^="e_"], .commercial_unit_mobile,
+.gb_v, #bres, #botstuff {
   display: none !important;
 }
 /* collapse the usual vertical rhythm - a 460px panel cannot afford it */
@@ -651,17 +654,23 @@ def save_settings(s: dict) -> None:
 def _responsive_script() -> str:
     """Strip Google's chrome and force the document to fill the viewport.
 
-    Idempotent: results hydrate after loadFinished, so this runs more than
-    once and must not pile up duplicate <style> tags.
+    Idempotent, and updates the existing <style> in place rather than
+    removing and re-appending it: a full style-tag swap forces the page to
+    restyle from scratch, which during progressive result hydration blanks
+    content that has not finished rendering.
     """
     return f"""
 (function(){{
-  var old = document.getElementById('kcircle-css');
-  if (old) old.remove();
-  var s = document.createElement('style');
-  s.id = 'kcircle-css';
-  s.textContent = {_RESPONSIVE_CSS!r};
-  (document.head || document.documentElement).appendChild(s);
+  var css = {_RESPONSIVE_CSS!r};
+  var s = document.getElementById('kcircle-css');
+  if (s) {{
+    if (s.textContent !== css) s.textContent = css;
+  }} else {{
+    s = document.createElement('style');
+    s.id = 'kcircle-css';
+    s.textContent = css;
+    (document.head || document.documentElement).appendChild(s);
+  }}
   var m = document.querySelector('meta[name=viewport]');
   if (!m) {{
     m = document.createElement('meta');
@@ -940,44 +949,59 @@ class ResultsPanel(QWidget):
         self.worker = None
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(12, 10, 12, 10)
-        outer.setSpacing(8)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(6)
 
+        # One header row holding +, the tab buttons, the title and x. A
+        # QTabWidget cannot sit inline with the buttons, so the tabs are
+        # toggle buttons driving a QStackedWidget instead.
         head_row = QHBoxLayout()
         head_row.setSpacing(4)
         self.new_btn = QPushButton("+")
         self.new_btn.setToolTip("Start a new capture")
-        self.new_btn.setFixedWidth(30)
-        self.new_btn.clicked.connect(self.newCapture.emit)
-        self.close_btn = QPushButton("×")
+        self.close_btn = QPushButton("\u00d7")
         self.close_btn.setToolTip("Close (Esc)")
-        self.close_btn.setFixedWidth(30)
         self.close_btn.clicked.connect(self.close)
         for b in (self.new_btn, self.close_btn):
+            b.setFixedWidth(28)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setStyleSheet(
                 "QPushButton{background:#34313d; color:#e6e1e5;"
-                "border:none; border-radius:5px; font-size:15px; padding:2px;}"
+                "border:none; border-radius:5px; font-size:15px; padding:1px;}"
                 "QPushButton:hover{background:#4a4557;}"
             )
+        self.new_btn.clicked.connect(self.newCapture.emit)
         head_row.addWidget(self.new_btn)
 
-        head = DragBar("  Circle to Search")
-        head.setStyleSheet(
-            f"color:{ACCENT}; font-size:15px; font-weight:600; padding:4px 0px;"
+        tab_qss = (
+            "QPushButton{background:#26242c; color:#9a96a0;"
+            "border:none; border-radius:5px; padding:4px 12px; font-size:13px;}"
+            "QPushButton:checked{background:#3a3742; color:#e6e1e5;}"
+            "QPushButton:hover{background:#332f3c;}"
         )
-        head_row.addWidget(head, 1)
+        self.tab_text = QPushButton("Text")
+        self.tab_visual = QPushButton("Visual matches")
+        for b in (self.tab_text, self.tab_visual):
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(tab_qss)
+        head_row.addWidget(self.tab_text)
+        head_row.addWidget(self.tab_visual)
+        head_row.addStretch(1)
+
+        title = DragBar("Circle to Search")
+        title.setStyleSheet(
+            f"color:{ACCENT}; font-size:13px; font-weight:600; padding:0 6px;")
+        title.setFixedHeight(22)
+        head_row.addWidget(title)
         head_row.addWidget(self.close_btn)
         outer.addLayout(head_row)
 
-        self.tabs = QTabWidget()
-        self.tabs.setStyleSheet(
-            "QTabWidget::pane{border:1px solid #34313d;border-radius:6px;}"
-            "QTabBar::tab{background:#2a2830;color:#9a96a0;padding:6px 14px;"
-            "border-top-left-radius:5px;border-top-right-radius:5px;}"
-            "QTabBar::tab:selected{background:#3a3742;color:#e6e1e5;}"
-        )
-        outer.addWidget(self.tabs, 1)
+        self.stack = QStackedWidget()
+        self.stack.setStyleSheet(
+            "QStackedWidget{border:1px solid #34313d;border-radius:6px;}")
+        outer.addWidget(self.stack, 1)
 
         # ---- tab 1: native text (fast, no browser engine involved)
         text_page = QWidget()
@@ -1053,7 +1077,7 @@ class ResultsPanel(QWidget):
             row.addWidget(b)
         self._refresh_mode_btn()
         tp.addLayout(row)
-        self.tabs.addTab(text_page, "Text")
+        self.stack.addWidget(text_page)
 
         # ---- tab 2: real Google Lens results (embedded, not a browser)
         self.web = None
@@ -1073,17 +1097,20 @@ class ResultsPanel(QWidget):
                 "border-radius:4px; font-size:11px;")
             self.web_status.move(6, 6)
             self.web_status.raise_()
-            self.tabs.addTab(web_page, "Visual matches")
+            self.stack.addWidget(web_page)
         else:
-            self.tabs.addTab(QLabel("PyQt6-WebEngine not installed"), "Visual matches")
+            self.stack.addWidget(QLabel("PyQt6-WebEngine not installed"))
 
-        self.tabs.currentChanged.connect(self._on_tab)
+        self.tab_text.setChecked(True)
+        self.tab_text.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        self.tab_visual.clicked.connect(lambda: self._select_visual())
         # Image search is the main event - open on it.
         if HAVE_WEBENGINE:
-            self.tabs.setCurrentIndex(1)
+            self._select_visual()
 
-        self.footer = QLabel("Esc to close   ·   drag title to move, corner to resize")
-        self.footer.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+        self.footer = QLabel("Esc close · drag title · corner resize")
+        self.footer.setStyleSheet(f"color:{MUTED}; font-size:11px; padding:0 2px;")
+        self.footer.setFixedHeight(16)
         outer.addWidget(self.footer)
 
         self.grip = ResizeGrip(self)
@@ -1244,7 +1271,7 @@ class ResultsPanel(QWidget):
         self.status.setText(f"done · {r.get('detected_language') or 'unknown'}")
 
         # the selection crop now exists - the visual tab can finally load
-        if self.tabs.currentIndex() == 1:
+        if self.stack.currentIndex() == 1:
             self._load_results()
 
     def on_error(self, msg):
@@ -1336,7 +1363,10 @@ class ResultsPanel(QWidget):
             return
         self._cancel_reflow()
         self._reflow_timers = []
-        for delay in (600, 1400, 2600):
+        # results hydrate after loadFinished, so give them a couple of nudges
+        # - but few. Every re-apply during hydration risks catching a result
+        # container mid-render.
+        for delay in (900, 2200):
             t = QTimer(self)
             t.setSingleShot(True)
             t.timeout.connect(self._apply_reflow)
@@ -1347,6 +1377,12 @@ class ResultsPanel(QWidget):
         for t in getattr(self, "_reflow_timers", None) or []:
             t.stop()
         self._reflow_timers = []
+
+    def _select_visual(self):
+        """Switch to the Visual matches page and load it if we can."""
+        self.tab_visual.setChecked(True)
+        self.stack.setCurrentIndex(1)
+        self._on_tab(1)
 
     def _on_tab(self, idx):
         """Only pay for the embedded engine when the user asks for it."""
