@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# kcircle launcher
+set -euo pipefail
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec "$DIR/.venv/bin/python" "$DIR/kcircle.py" "$@"

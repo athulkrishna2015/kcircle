@@ -1,0 +1,48 @@
+MIT License
+
+Copyright (c) 2026 kcircle contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+This project is not a fork. It was written from scratch and makes use of the
+following third-party components and prior art:
+
+  chrome-lens-py (MIT) - https://github.com/bropines/chrome-lens-py
+      Installed as a pip dependency. Provides the client for Google's Lens
+      Protobuf endpoint used for OCR and translation.
+
+  jaslrobinson/circle-to-search (MIT)
+      https://github.com/jaslrobinson/circle-to-search
+      Prior art consulted during research. The general "freeze screen, draw a
+      selection, search it" interaction concept. No source code was used.
+
+  dinossht/lens-desktop
+      https://github.com/dinossht/lens-desktop
+      Prior art consulted during research. The idea of presenting search
+      results in a dedicated panel rather than a full browser window. No
+      source code was used.
+
+  PyQt6 / Qt for Python (LGPLv3)
+      https://pypi.org/project/PyQt6/
+
+Google Lens is a Google service governed by Google's own terms of service.
+kcircle transmits the region a user explicitly selects, in the same manner as
+the official Circle to Search feature.

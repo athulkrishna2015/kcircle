@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Circle to Search
+GenericName=Screen region search
+Comment=Draw around anything on screen and search it with Google Lens
+Exec=/home/admin/.local/share/kcircle/kcircle
+Icon=preferences-desktop
+Terminal=false
+Categories=Utility;
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
