@@ -265,8 +265,7 @@ class SelectionOverlay(QWidget):
             self.path = [e.position().toPoint()]
         self.origin = e.position().toPoint()
         self.current = self.origin
-        self.glow.spark = QPointF(e.position())
-        self.glow.path = QPainterPath(QPointF(self.origin))
+        self.glow.begin(QPointF(e.position()))
         self._glow_timer.start(16)          # ~60fps
         self.update()
 
@@ -645,23 +644,34 @@ class GlowTrail:
         self.path = QPainterPath()
         self.spark = QPointF()
         self.t = 0.0
+        # QPainterPath.isEmpty() is True for a path holding only a moveTo,
+        # so a press with no motion yet would paint nothing. Track it.
+        self.drawing = False
+
+    def begin(self, at: QPointF):
+        self.drawing = True
+        self.spark = at
+        self.path = QPainterPath(at)
 
     def clear(self):
         self.path = QPainterPath()
         self.t = 0.0
+        self.drawing = False
 
     @property
     def active(self):
-        return not self.path.isEmpty()
+        return self.drawing
 
     def paint(self, p):
-        if self.path.isEmpty():
+        if not self.drawing:
             return
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         length = self.path.length()
         if length <= 0:
+            # pressed but not moved: just the spark
+            self._paint_spark(p)
             p.restore()
             return
         head = min(length, self.t * length)
@@ -705,6 +715,10 @@ class GlowTrail:
         p.drawPath(tail)
 
         # 4. spark at the leading edge
+        self._paint_spark(p)
+        p.restore()
+
+    def _paint_spark(self, p):
         halo = QRadialGradient(self.spark, 22)
         halo.setColorAt(0.0, QColor(255, 255, 255, 190))
         halo.setColorAt(0.35, QColor(140, 190, 255, 120))
@@ -718,7 +732,6 @@ class GlowTrail:
         core.setColorAt(1.0, QColor(255, 255, 255, 0))
         p.setBrush(QBrush(core))
         p.drawEllipse(self.spark, 8, 8)
-        p.restore()
 
 
 class Shimmer(QWidget):
