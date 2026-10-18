@@ -8,9 +8,19 @@ and Google answers. On desktop the official equivalents are all locked inside
 the browser. Chrome's Lens overlay only sees the current web page, and Gemini's
 "Select from screen" is limited to Chromebook Plus, Mac and Windows.
 
-kcircle brings the gesture to the whole desktop. Freeze the screen, drag a box
-over anything — a PDF, a video, a terminal, a photo on your desktop — and the
+kcircle brings the gesture to the whole desktop. Freeze the screen, draw around
+anything — a PDF, a video, a terminal, a photo on your desktop — and the
 results land in a compact always-on-top panel.
+
+## Screenshots
+
+The results panel, showing a live Google Lens search rendered in place:
+
+![kcircle results panel](docs/panel.png)
+
+The animated glow that follows your stroke while you draw:
+
+![the selection glow](docs/glow.png)
 
 ```
 ╭─ kcircle ──────────────────────────────╮
@@ -34,8 +44,8 @@ results land in a compact always-on-top panel.
 - **Works on any application.** Capture is compositor-level, not
   browser-level.
 - **True Circle to Search.** Draw a lasso around a subject and the crop is
-  alpha-masked to your stroke, so Lens sees the thing you circled rather than
-  its bounding box.
+  masked to your stroke and trimmed tight, so Lens sees the thing you circled
+  rather than the whole screen around it.
 - **Animated glow** while you draw: a soft halo, a bright core, a comet tail
   and a spark that rides the cursor.
 - **Real Google Lens results** — AI Overview, Exact matches, Visual matches —
@@ -43,9 +53,23 @@ results land in a compact always-on-top panel.
 - **Instant OCR** on the Text tab, no browser engine involved.
 - **Four selection shapes** — `corner`, `rect`, `lasso`, `ellipse` — with the
   choice remembered between runs. Hold Shift in `corner` mode for a square.
+- **Three capture scopes** — draw a region, grab the active window, or take
+  the whole screen.
+- **Reusable.** The `+` button starts another capture; the panel gets out of
+  the way while you select.
 - **User-agent switch** between Google's mobile and desktop presentations,
   remembered between runs.
 - **Resizable and movable**, with position and size remembered.
+
+## Capture scopes
+
+| Scope | Behaviour |
+| --- | --- |
+| `select` | freeze the screen, then draw a region |
+| `window` | the focused window only, no drawing step |
+| `screen` | the entire screen, no drawing step |
+
+Switch with the **Scope** button. Remembered between runs.
 
 ## Selection shapes
 
@@ -118,6 +142,26 @@ uv pip install -r requirements.txt
 `Pillow` comes in as a `chrome-lens-py` dependency and is what draws the lasso
 alpha mask. At runtime you also need `spectacle`, which ships with Plasma.
 
+### A note on size
+
+The environment is roughly **560 MB**, and nearly all of it is QtWebEngine:
+`libQt6WebEngineCore.so` alone is ~194 MB, because the wheel bundles a full
+Chromium.
+
+If your distribution already ships PyQt6 and QtWebEngine (Arch does:
+`python-pyqt6` and `qt6-webengine`), you can build a venv that reuses them and
+drop to about **32 MB**:
+
+```bash
+uv venv --system-site-packages
+uv pip install chrome-lens-py
+```
+
+Be aware that some distro combinations are mismatched — Arch currently pairs
+PyQt6 6.11.0 with Qt 6.11.2, and `QWebEngineView` aborts on load. kcircle
+probes WebEngine in a subprocess at startup, so this failure degrades to
+OCR-only instead of taking the app down.
+
 To upgrade later:
 
 ```bash
@@ -129,10 +173,14 @@ uv pip install --upgrade -r requirements.txt
 ```
 
 1. The screen freezes and dims.
-2. Draw around what you want — box, ellipse or lasso. Right-click or `Esc`
-   cancels.
+2. Draw around what you want — box, ellipse, square or lasso. Right-click or
+   `Esc` cancels.
 3. Results appear in the panel, image search already open. Drag the title to
    move, grab the bottom-right corner to resize, `Esc` to close.
+4. Press `+` for another capture — the panel hides while you select.
+
+The four buttons along the bottom cycle **Shape**, **UA** and **Scope**, and
+copy text to the clipboard. `+` starts a new capture, `×` closes.
 
 Bind a shortcut in *System Settings → Shortcuts → Custom Shortcuts*:
 
@@ -146,16 +194,28 @@ Command: /path/to/kcircle/kcircle
 
 | File | Purpose |
 | --- | --- |
-| `settings.json` | `{"ua": "desktop"\|"mobile", "mode": "corner"\|"rect"\|"lasso"\|"ellipse"}` |
+| `settings.json` | `{"ua": "desktop"\|"mobile", "mode": "corner"\|"rect"\|"lasso"\|"ellipse", "scope": "select"\|"window"\|"screen"}` |
 | `geometry.json` | panel position and size |
+| `kcircle.log` | debug log, see below |
 
-Both are written from the panel buttons, so you rarely need to edit them.
+All are written from the panel buttons, so you rarely need to edit them.
 
 Environment:
 
 | Variable | Effect |
 | --- | --- |
 | `KCIRCLE_TRANSLATE` | target language code, e.g. `de`, `fr` |
+| `KCIRCLE_LOG` | `debug` for verbose logging, or a log file path |
+| `KCIRCLE_BYPASS_WM` | `1` to add `BypassWindowManagerHint` to the overlay |
+
+Debug logging records the selection region, the crop size, how much of the
+upload the mask covers, and which file is sent to Google — enough to diagnose
+a selection that comes back wrong:
+
+```bash
+KCIRCLE_LOG=debug ./kcircle
+tail -f ~/.config/kcircle/kcircle.log
+```
 
 ## How it works
 
@@ -199,6 +259,10 @@ official feature does.
 - Google's endpoints are unofficial and may change without notice.
 - The selection is a rectangle, ellipse or freehand lasso — not the pressure-
   or curvature-aware stroke of the Android original.
+- The Visual matches tab needs QtWebEngine. If the bundled engine is missing
+  or crashes (some distro Qt/PyQt6 combinations abort on load), kcircle detects
+  that in a subprocess at startup and falls back to OCR-only rather than
+  crashing.
 
 ## License
 

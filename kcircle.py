@@ -22,13 +22,14 @@ from PyQt6.QtCore import (
     QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QFont, QGuiApplication, QImage, QLinearGradient, QPainter,
-    QPainterPath, QPen, QPixmap, QRadialGradient, QRegion,
+    QBrush, QColor, QFont, QGuiApplication, QImage, QKeySequence, QLinearGradient,
+    QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QRegion, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QPushButton, QTabWidget, QVBoxLayout,
     QWidget,
 )
+from PyQt6.QtGui import QKeySequence
 
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -36,6 +37,39 @@ try:
 except Exception:                                    # noqa: BLE001
     QWebEngineView = None
     HAVE_WEBENGINE = False
+
+
+def webengine_is_healthy() -> bool:
+    """Probe WebEngine in a subprocess.
+
+    Importing the bindings is not enough: constructing a QWebEngineView can
+    hard-abort the process (seen with Arch's python-pyqt6 6.11.0 against
+    qt6 6.11.2, where the bindings and the runtime are a patch apart). A
+    SIGABRT cannot be caught, so the only safe check is to try it out of
+    process and degrade to OCR-only if it dies.
+    """
+    if not HAVE_WEBENGINE:
+        return False
+    probe = (
+        "import sys;"
+        "from PyQt6.QtWidgets import QApplication;"
+        "from PyQt6.QtCore import QTimer;"
+        "from PyQt6.QtWebEngineWidgets import QWebEngineView;"
+        "app=QApplication(sys.argv[:1]);v=QWebEngineView();v.resize(400,300);"
+        "v.page().profile().setHttpUserAgent('probe');"
+        "v.setHtml('<html><body>probe</body></html>');"
+        "QTimer.singleShot(2500, app.quit);app.exec()"
+    )
+    try:
+        r = subprocess.run([sys.executable, "-c", probe],
+                           capture_output=True, timeout=60)
+        if r.returncode != 0 and logg:
+            err = (r.stderr or b"").decode(errors="replace").strip().splitlines()
+            logg.debug("webengine probe failed rc=%s: %s", r.returncode,
+                       err[-1] if err else "(no stderr)")
+        return r.returncode == 0
+    except Exception:                                # noqa: BLE001
+        return False
 
 # ----------------------------------------------------------------- config
 
@@ -96,8 +130,15 @@ logg = None
 
 # ----------------------------------------------------------------- capture
 
-def capture() -> str:
-    """Grab the whole screen. Returns a PNG path.
+CAPTURE_SCOPES = ["select", "window", "screen"]
+
+
+def capture(scope: str = "select") -> str:
+    """Grab the screen. Returns a PNG path.
+
+    scope="select"  full screen; the user then draws the region
+    scope="window"  the active window only
+    scope="screen"  the whole screen, no selection step
 
     spectacle is used because it is KDE's own capture path and is already
     authorised in-session; the ScreenShot2 D-Bus route additionally needs a
@@ -108,16 +149,19 @@ def capture() -> str:
         _tmpdir = tempfile.mkdtemp(prefix="kcircle-")
     path = os.path.join(_tmpdir, "screen.png")
 
-    if shutil.which("spectacle"):
-        subprocess.run(
-            ["spectacle", "-b", "-n", "-f", "-o", path],
-            check=True, capture_output=True, timeout=30,
-        )
-    else:
+    if not shutil.which("spectacle"):
         raise RuntimeError("spectacle not found - cannot capture the screen")
+
+    flag = {"select": "-f", "window": "-a", "screen": "-f"}.get(scope, "-f")
+    subprocess.run(
+        ["spectacle", "-b", "-n", flag, "-o", path],
+        check=True, capture_output=True, timeout=30,
+    )
 
     if not os.path.exists(path):
         raise RuntimeError("capture produced no file")
+    if logg:
+        logg.debug("captured scope=%s -> %s", scope, path)
     return path
 
 
@@ -141,6 +185,9 @@ class SelectionOverlay(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        # keyPressEvent only fires when the widget has focus, which a frameless
+        # always-on-top window does not get for free on Wayland
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setMouseTracking(True)
 
@@ -854,6 +901,7 @@ class ResultsPanel(QWidget):
     """Small always-on-top card. Stays out of the way, closes on Esc."""
 
     finished = pyqtSignal()
+    newCapture = pyqtSignal()
 
     def __init__(self, shot_path: str, region: tuple, translate_to: str | None,
                  poly: list | None = None):
@@ -865,6 +913,8 @@ class ResultsPanel(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Esc needs focus to reach keyPressEvent
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setStyleSheet(f"background:{PANEL_BG}; color:{FG};")
         self.setMinimumSize(MIN_PANEL_W, MIN_PANEL_H)
         self.resize(PANEL_W, PANEL_H)
@@ -874,17 +924,41 @@ class ResultsPanel(QWidget):
         self.shot_path = shot_path
         self.region = region
         self._crop = shot_path
+        self._poly = poly
+        self._translate_to = translate_to
+        self._started = False
+        self.worker = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 10, 12, 10)
         outer.setSpacing(8)
 
-        head = DragBar("   Circle to Search")
+        head_row = QHBoxLayout()
+        head_row.setSpacing(4)
+        self.new_btn = QPushButton("+")
+        self.new_btn.setToolTip("Start a new capture")
+        self.new_btn.setFixedWidth(30)
+        self.new_btn.clicked.connect(self.newCapture.emit)
+        self.close_btn = QPushButton("×")
+        self.close_btn.setToolTip("Close (Esc)")
+        self.close_btn.setFixedWidth(30)
+        self.close_btn.clicked.connect(self.close)
+        for b in (self.new_btn, self.close_btn):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(
+                "QPushButton{background:#34313d; color:#e6e1e5;"
+                "border:none; border-radius:5px; font-size:15px; padding:2px;}"
+                "QPushButton:hover{background:#4a4557;}"
+            )
+        head_row.addWidget(self.new_btn)
+
+        head = DragBar("  Circle to Search")
         head.setStyleSheet(
-            f"color:{ACCENT}; font-size:15px; font-weight:600;"
-            "padding:4px 0px;"
+            f"color:{ACCENT}; font-size:15px; font-weight:600; padding:4px 0px;"
         )
-        outer.addWidget(head)
+        head_row.addWidget(head, 1)
+        head_row.addWidget(self.close_btn)
+        outer.addLayout(head_row)
 
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(
@@ -939,6 +1013,18 @@ class ResultsPanel(QWidget):
         self._settings0 = load_settings()
         self._mode = self._settings0.get("mode", "rect")
         self._ua_mode = self._settings0.get("ua", "mobile")
+        self._scope = self._settings0.get("scope", "select")
+        if self._scope not in CAPTURE_SCOPES:
+            self._scope = "select"
+        self.scope_btn = QPushButton()
+        self.scope_btn.clicked.connect(self.cycle_scope)
+        self.scope_btn.setToolTip(
+            "What gets captured on the next search.\n\n"
+            "select - freeze the screen, then draw a region\n"
+            "window - the active window, no drawing\n"
+            "screen - the whole screen, no drawing"
+        )
+        self._refresh_scope_btn()
         self.ua_btn = QPushButton(f"UA: {self._ua_mode}")
         self.ua_btn.clicked.connect(self.toggle_ua)
         self.ua_btn.setToolTip(
@@ -947,7 +1033,7 @@ class ResultsPanel(QWidget):
             "desktop - richer result set, restyled to fit\n\n"
             "Applies to the Visual matches tab."
         )
-        for b in (self.copy_btn, self.mode_btn, self.ua_btn):
+        for b in (self.copy_btn, self.mode_btn, self.ua_btn, self.scope_btn):
             b.setStyleSheet(
                 "QPushButton{background:#34313d; color:#e6e1e5;"
                 "border:none; border-radius:5px; padding:7px 11px;}"
@@ -999,12 +1085,27 @@ class ResultsPanel(QWidget):
 
         self._ocr = ""
 
-        self.worker = LensWorker(shot_path, region, translate_to, poly)
+        self.place_near_cursor()
+
+        # Esc closes the panel even if the compositor never gave us focus
+        self._esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._esc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._esc.activated.connect(self.close)
+
+    def show_results(self):
+        """Kick off the Lens request and make the panel visible."""
+        if getattr(self, "_started", False):
+            return
+        self._started = True
+        self.worker = LensWorker(self.shot_path, self.region,
+                                 self._translate_to, self._poly)
         self.worker.done.connect(self.on_result)
         self.worker.failed.connect(self.on_error)
         self.worker.start()
-
-        self.place_near_cursor()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
 
     def _apply_mask(self):
         self.setMask(rounded_mask(self.width(), self.height(), 14))
@@ -1116,6 +1217,10 @@ class ResultsPanel(QWidget):
         self.text.setText("\n\n".join(parts) if parts else "No text or objects found here.")
         self.status.setText(f"done · {r.get('detected_language') or 'unknown'}")
 
+        # the selection crop now exists - the visual tab can finally load
+        if self.tabs.currentIndex() == 1:
+            self._load_results()
+
     def on_error(self, msg):
         if not hasattr(self, "shimmer"):
             return
@@ -1153,6 +1258,19 @@ class ResultsPanel(QWidget):
         self._refresh_mode_btn()
         self.footer.setText(f"Next selection: {self._mode}")
 
+    def _refresh_scope_btn(self):
+        names = {"select": "▣ select", "window": "▢ window",
+                 "screen": "▦ screen"}
+        self.scope_btn.setText(names.get(self._scope, self._scope))
+
+    def cycle_scope(self):
+        self._scope = CAPTURE_SCOPES[
+            (CAPTURE_SCOPES.index(self._scope) + 1) % len(CAPTURE_SCOPES)]
+        self._settings0["scope"] = self._scope
+        save_settings(self._settings0)
+        self._refresh_scope_btn()
+        self.footer.setText(f"Next capture: {self._scope}")
+
     def toggle_ua(self):
         """Flip between Google's mobile and desktop presentations."""
         if self.web is None:
@@ -1165,10 +1283,7 @@ class ResultsPanel(QWidget):
         self.web.page().profile().setHttpUserAgent(UA_PRESETS[self._ua_mode])
 
         # re-run the search with the new identity
-        self.web_status.setText(f"Reloading as {self._ua_mode}...")
-        crop = getattr(self, "_crop", self.shot_path)
-        if os.path.exists(crop):
-            self.web.setHtml(_upload_page(crop))
+        self._load_results(force=True)
 
     def _on_web_loaded(self, ok):
         """Re-apply the responsive rules after every navigation."""
@@ -1209,11 +1324,36 @@ class ResultsPanel(QWidget):
 
     def _on_tab(self, idx):
         """Only pay for the embedded engine when the user asks for it."""
-        if idx == 1 and self.web is not None and not getattr(self, "_web_loaded", False):
-            self._web_loaded = True
-            crop = getattr(self, "_crop", self.shot_path)
-            self.web_status.setText("Contacting Google Lens...")
-            self.web.setHtml(_upload_page(crop))
+        if idx == 1 and self.web is not None:
+            self._load_results()
+
+    @property
+    def _crop_ready(self):
+        """True once the worker has produced the real selection crop.
+
+        Until then self._crop is still the full screenshot. Uploading that is
+        exactly how the tool ended up searching the whole screen, so the
+        visual tab must refuse to load until the crop exists.
+        """
+        c = getattr(self, "_crop", None)
+        return bool(c) and c != self.shot_path and os.path.exists(c)
+
+    def _load_results(self, force=False):
+        if self.web is None:
+            return
+        if getattr(self, "_web_loaded", False) and not force:
+            return
+        if not self._crop_ready:
+            self.web_status.setText("Waiting for the selection…")
+            if logg:
+                logg.debug("visual tab requested before the crop exists; "
+                           "not uploading the full screenshot")
+            return
+        self._web_loaded = True
+        self.web_status.setText("Contacting Google Lens...")
+        if logg:
+            logg.info("uploading selection: %s", self._crop)
+        self.web.setHtml(_upload_page(self._crop))
 
     def open_browser(self):
         """Last resort: hand the crop to the system browser."""
@@ -1251,58 +1391,98 @@ class ResultsPanel(QWidget):
 # ----------------------------------------------------------------- main
 
 def main():
-    global logg
+    global logg, HAVE_WEBENGINE
     logg = setup_logging()
     translate_to = os.environ.get("KCIRCLE_TRANSLATE") or None
-    logg.info("kcircle start (translate=%s, settings=%s)",
-              translate_to or "off", load_settings())
+
+    if HAVE_WEBENGINE and not webengine_is_healthy():
+        logg.warning("QtWebEngine is installed but crashes on this system "
+                     "(likely a PyQt6/Qt patch mismatch). Disabling the "
+                     "Visual matches tab; OCR and translation still work.")
+        HAVE_WEBENGINE = False
+        QWebEngineView = None
+
+    logg.info("kcircle start (translate=%s, webengine=%s, settings=%s)",
+              translate_to or "off", HAVE_WEBENGINE, load_settings())
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    state = {"panel": None, "overlay": None}
 
-    def begin():
+    def begin_capture():
+        """Hide the panel, freeze the screen, wait for a selection."""
+        panel = state["panel"]
+        if panel is not None:
+            panel.hide()
+            panel._cancel_reflow()
+        scope = load_settings().get("scope", "select")
+        if scope not in CAPTURE_SCOPES:
+            scope = "select"
         try:
-            shot = capture()
-            logg.info("captured %s", shot)
+            shot = capture(scope)
+            logg.info("captured scope=%s -> %s", scope, shot)
         except Exception as exc:                     # noqa: BLE001
             logg.error("capture failed: %s", exc)
             QTimer.singleShot(200, app.quit)
             return
 
+        def show_panel(shot_path, region, poly):
+            old = state["panel"]
+            if old is not None:
+                old.deleteLater()
+            new = ResultsPanel(shot_path, region, translate_to, poly)
+            new.newCapture.connect(begin_capture)
+            new.finished.connect(app.quit)
+            state["panel"] = new
+            new.show_results()
+
+        if scope != "select":
+            # the capture IS the selection here, so skip the overlay entirely
+            logg.info("scope=%s: searching the capture directly", scope)
+            show_panel(shot, (0.0, 0.0, 1.0, 1.0), None)
+            return
+
         ov = SelectionOverlay(shot)
+        state["overlay"] = ov
 
         def on_pick(selection):
             ov.close()
             region, poly = selection
             logg.info("picked region=%.3f,%.3f-%.3f,%.3f poly=%s",
                       *region, f"{len(poly)}pts" if poly else "none")
-            panel = ResultsPanel(shot, region, translate_to, poly)
-            app._panel = panel                     # keep a reference alive
-            # one-shot tool: closing the results ends the process
-            panel.finished.connect(app.quit)
+            show_panel(shot, region, poly)
 
         def on_cancel():
             logg.info("cancelled by user")
             ov.close()
-            app.quit()
+            if state["panel"] is not None:
+                state["panel"].show()
+                state["panel"].raise_()
+            else:
+                app.quit()
 
         ov.picked.connect(on_pick)
         ov.cancelled.connect(on_cancel)
         ov.show()
+        # Esc must work even if KWin refuses us keyboard focus, so grab the key
+        # at application level rather than relying on keyPressEvent
+        esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), ov)
+        esc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        esc.activated.connect(on_cancel)
+        ov._esc_shortcut = esc
         if os.environ.get("KCIRCLE_BYPASS_WM") == "1":
-            # escape hatch if stacking still misbehaves on a given setup
             ov.setWindowFlag(Qt.WindowType.BypassWindowManagerHint, True)
             ov.show()
-        # raise/activate again once the event loop has settled - the first
-        # show() can land before the compositor has finished mapping
+
         def _focus():
             ov.raise_()
             ov.activateWindow()
+            ov.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
             ov.update()
         QTimer.singleShot(0, _focus)
         QTimer.singleShot(180, _focus)
 
-    QTimer.singleShot(60, begin)
+    QTimer.singleShot(60, begin_capture)
     sys.exit(app.exec())
 
 
