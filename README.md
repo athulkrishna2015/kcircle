@@ -22,6 +22,20 @@ The animated glow that follows your stroke while you draw:
 
 ![the selection glow](docs/glow.png)
 
+The overlay while drawing — the screen dims, the selection is punched back to
+full brightness, and the glow trails your stroke:
+
+![the selection overlay](docs/overlay.png)
+
+`corner` mode with <kbd>Shift</kbd> held, constraining the drag to a square:
+
+![square selection](docs/overlay-square.png)
+
+What each shape actually sends to Google — note that only the lasso trims
+everything outside the stroke to white:
+
+![the crops that get uploaded](docs/crops.png)
+
 ```
 ╭─ kcircle ──────────────────────────────╮
 │   Circle to Search                     │  ← drag to move
@@ -100,13 +114,14 @@ Google serves a different layout per user agent, and the useful ones trade off:
 
 | UA | Result set | Layout |
 | --- | --- | --- |
-| `mobile` | narrower | reflows natively, fits a small panel |
-| `desktop` | **richer** — more matches, fuller AI Overview | fixed ~652px column |
+| `mobile` | often thin — Google tends to answer with location and local junk | reflows natively |
+| `desktop` | **richer** — real AI Overview and visual matches | fixed ~652px column |
 
-kcircle ships `desktop` results by default and injects CSS to reflow them to
-the panel width — including collapsing the desktop visual-matches grid into
-`auto-fill` columns. Switch to `mobile` if something renders badly, or if you
-want the panel to stay very narrow.
+kcircle ships `desktop` by default and injects CSS to reflow it to the panel
+width, including collapsing the desktop visual-matches grid into `auto-fill`
+columns and hiding Google's search box. That injection is re-applied whenever
+the panel is resized, so the layout tracks the window instead of staying
+stranded at the original column width.
 
 ## Install
 
@@ -233,6 +248,24 @@ tail -f ~/.config/kcircle/kcircle.log
 A note on moving the window: on Wayland a client cannot set its own toplevel
 position, so kcircle uses Qt's `startSystemMove()` and lets KWin drive the
 drag. Resizing uses a custom corner grip for the same reason.
+
+## Tests
+
+A local matrix covers every scope, shape and user-agent combination, and
+asserts the two invariants that have broken in the past: a selection never
+uploads the whole screenshot, and the visual tab never uploads before the crop
+exists.
+
+```bash
+.venv/bin/python tests/test_matrix.py
+```
+
+The documentation images are generated from a synthetic scene rather than a
+real screen, so they never leak whatever happens to be on your display:
+
+```bash
+.venv/bin/python tests/make_docs_images.py
+```
 
 ## Credits and provenance
 

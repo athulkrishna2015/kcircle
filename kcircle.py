@@ -456,6 +456,11 @@ def crop_region(shot_path: str, region: tuple, poly: list | None = None) -> str:
     elif poly is not None:
         L("mask: skipped, polygon had %d points (need 3+)", len(poly))
 
+    # Always hand Google an opaque RGB. An RGBA upload gets composited by the
+    # receiver on an arbitrary background, which corrupts OCR.
+    if cut.mode != "RGB":
+        cut = cut.convert("RGB")
+
     cut.save(out, "PNG")
     L("crop saved: %s (%dx%d)", out, cut.size[0], cut.size[1])
     return out
@@ -587,6 +592,14 @@ div:empty, span:empty, p:empty, section:empty {
   padding-top: 2px !important; padding-bottom: 2px !important;
   margin-top: 0 !important; margin-bottom: 0 !important;
 }
+/* The modern search box is a rounded pill built from textarea[name=q] inside
+   a form, not the old #searchform. Hiding it and its spacer is what stops it
+   eating a third of the panel height. */
+form[action="/search"], #search, .M8OgIe, .nDcEnd,
+textarea[name="q"], input[name="q"], textarea[aria-label*="earch"],
+div[role="search"], #APjFqb, .v7vKf, .lAUtv, .sb_form_c {
+  display: none !important;
+}
 /* the tab strip and its spacer */
 #tOpsSpacer, #center_col > div:not(#rso):not(#bres),
 .gb_v, #bres, [id^="e_"], #botstuff {
@@ -595,9 +608,6 @@ div:empty, span:empty, p:empty, section:empty {
 /* the AI Overview card hugs its text instead of padding into a slab */
 [jsname], .WwrzSb, .lwZc0, .VwiC3b {
   padding: 6px 8px !important; margin: 2px 0 !important;
-}
-@media (min-width: 900px) {
-  #center_col { padding-left: 8px !important; padding-right: 8px !important; }
 }
 """
 
@@ -1012,7 +1022,7 @@ class ResultsPanel(QWidget):
         )
         self._settings0 = load_settings()
         self._mode = self._settings0.get("mode", "rect")
-        self._ua_mode = self._settings0.get("ua", "mobile")
+        self._ua_mode = self._settings0.get("ua", "desktop")
         self._scope = self._settings0.get("scope", "select")
         if self._scope not in CAPTURE_SCOPES:
             self._scope = "select"
@@ -1155,7 +1165,23 @@ class ResultsPanel(QWidget):
             grip.raise_()
         self._place_shimmer()
         self._apply_mask()
+        # Google re-lays-out on its own breakpoints, so the injected CSS has
+        # to be re-applied whenever the panel changes width - otherwise
+        # resizing the window leaves the desktop layout stranded at its
+        # original fixed column
+        if self.web is not None:
+            self._resize_reflow()
         super().resizeEvent(e)
+
+    def _resize_reflow(self):
+        """Debounced CSS re-apply after a resize."""
+        t = getattr(self, "_resize_timer", None)
+        if t is None:
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._apply_reflow)
+            self._resize_timer = t
+        t.start(220)
 
     def moveEvent(self, e):
         super().moveEvent(e)
@@ -1341,15 +1367,18 @@ class ResultsPanel(QWidget):
     def _load_results(self, force=False):
         if self.web is None:
             return
-        if getattr(self, "_web_loaded", False) and not force:
-            return
         if not self._crop_ready:
             self.web_status.setText("Waiting for the selection…")
             if logg:
                 logg.debug("visual tab requested before the crop exists; "
                            "not uploading the full screenshot")
             return
-        self._web_loaded = True
+        # upload each crop exactly once: Google re-renders on resize and on
+        # every navigation, and re-POSTing the image each time is both slow
+        # and pointless
+        if getattr(self, "_uploaded_crop", None) == self._crop and not force:
+            return
+        self._uploaded_crop = self._crop
         self.web_status.setText("Contacting Google Lens...")
         if logg:
             logg.info("uploading selection: %s", self._crop)

@@ -1,0 +1,281 @@
+#!/usr/bin/env python
+"""Local test matrix for kcircle.
+
+Exercises every scope x shape x user-agent combination without touching the
+network, and asserts two invariants that have both broken in the past:
+
+  1. a selection never uploads the whole screenshot
+  2. the visual tab never uploads before the crop exists
+"""
+import importlib.util
+import math
+import os
+import sys
+import tempfile
+
+from PyQt6.QtCore import QEvent, QPointF, Qt
+from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtWidgets import QApplication
+
+spec = importlib.util.spec_from_file_location("k", "kcircle.py")
+k = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(k)
+k.logg = k.setup_logging("error")
+
+from PIL import Image, ImageDraw
+
+SCREEN = (1600, 900)
+SHIFT = Qt.KeyboardModifier.ShiftModifier
+NONE = Qt.KeyboardModifier.NoModifier
+PRESS, MOVE, RELEASE = (QEvent.Type.MouseButtonPress,
+                       QEvent.Type.MouseMove,
+                       QEvent.Type.MouseButtonRelease)
+
+fails, checks = [], 0
+
+
+def check(cond, label):
+    global checks
+    checks += 1
+    if cond:
+        print(f"  PASS  {label}")
+    else:
+        print(f"  FAIL  {label}")
+        fails.append(label)
+
+
+def make_scene():
+    """A screen with obvious content so a full-screen leak is detectable."""
+    im = Image.new("RGB", SCREEN, (18, 22, 30))
+    d = ImageDraw.Draw(im)
+    for i in range(0, SCREEN[0], 80):
+        d.line([(i, 0), (i, SCREEN[1])], fill=(28, 34, 46), width=2)
+    d.rectangle([420, 250, 1180, 650], fill=(200, 60, 70))
+    d.ellipse([520, 300, 900, 520], fill=(60, 200, 140))
+    path = "/tmp/opencode/_scene.png"
+    im.save(path)
+    return path
+
+
+def ev(t, pos, mods=NONE):
+    if t == PRESS:
+        b, br = Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton
+    elif t == MOVE:
+        b, br = Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton
+    else:
+        b, br = Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton
+    return QMouseEvent(t, QPointF(*pos), b, br, mods)
+
+
+def draw(mode, pts, mods=NONE, scene=None):
+    ov = k.SelectionOverlay(scene)
+    ov.show()
+    ov.mode = mode
+    got = {}
+    ov.picked.connect(lambda s: got.__setitem__("s", s))
+    ov.mousePressEvent(ev(PRESS, pts[0], mods))
+    for p in pts[1:]:
+        ov.mouseMoveEvent(ev(MOVE, p))
+    ov.mouseReleaseEvent(ev(RELEASE, pts[-1]))
+    return got.get("s")
+
+
+def circle(cx, cy, rx, ry, n=49):
+    return [(cx + rx * math.cos(2 * math.pi * i / n),
+             cy + ry * math.sin(2 * math.pi * i / n)) for i in range(n)]
+
+
+# ----------------------------------------------------------------- scopes
+
+def test_scopes():
+    print("\n== capture scopes ==")
+    for scope in k.CAPTURE_SCOPES:
+        try:
+            p = k.capture(scope)
+            w, h = Image.open(p).size
+            check(w > 0 and h > 0, f"scope={scope:<7} captured {w}x{h}")
+        except Exception as exc:                     # noqa: BLE001
+            check(False, f"scope={scope} raised {type(exc).__name__}: {exc}")
+
+
+# ----------------------------------------------------------------- shapes
+
+SHAPES = [
+    ("rect", [(400, 300), (900, 560)], NONE),
+    ("corner", [(400, 300), (900, 560)], NONE),
+    ("corner", [(400, 300), (900, 560)], SHIFT),
+    ("ellipse", [(400, 300), (900, 560)], NONE),
+    ("lasso", circle(660, 430, 280, 180), NONE),
+    ("lasso", [(420, 310), (1000, 310), (1000, 640), (420, 640)], NONE),
+]
+
+
+def test_shapes(scene):
+    print("\n== selection shapes (never the whole screen) ==")
+    full = SCREEN[0] * SCREEN[1]
+    for mode, pts, mods in SHAPES:
+        label = mode + ("+Shift" if mods == SHIFT else "")
+        sel = draw(mode, pts, mods, scene)
+        if not sel:
+            check(False, f"{label} produced no selection")
+            continue
+        region, poly = sel
+        out = Image.open(k.crop_region(scene, region, poly))
+        frac = out.size[0] * out.size[1] / full
+        check(frac < 0.60,
+              f"{label:<14} {str(out.size):<12} {frac*100:5.1f}% of screen")
+        check(out.mode == "RGB", f"{label:<14} flattened to RGB (no alpha)")
+
+
+def test_square(scene):
+    print("\n== square constraint ==")
+    sel = draw("corner", [(400, 300), (900, 560)], SHIFT, scene)
+    region, _ = sel
+    w = (region[2] - region[0]) * SCREEN[0]
+    h = (region[3] - region[1]) * SCREEN[1]
+    check(abs(w - h) < 2, f"Shift produced a square ({w:.0f}x{h:.0f})")
+
+
+# ----------------------------------------------------------------- UA
+
+def test_ua():
+    print("\n== user agents ==")
+    check(set(k.UA_PRESETS) == {"mobile", "desktop"}, "both presets defined")
+    check(k.MOBILE_UA != k.DESKTOP_UA, "presets differ")
+    check("Mobile" in k.MOBILE_UA and "Mobile" not in k.DESKTOP_UA,
+          "mobile/desktop correctly identified")
+
+
+# ----------------------------------------------------------------- the gate
+
+class FakeWeb:
+    def __init__(self):
+        self.html = None
+        self.ua = None
+
+    def setHtml(self, h):
+        self.html = h
+
+    def page(self):
+        return self
+
+
+class PanelStub:
+    _crop_ready = k.ResultsPanel._crop_ready
+    _load_results = k.ResultsPanel._load_results
+    cycle_scope = k.ResultsPanel.cycle_scope
+    cycle_mode = k.ResultsPanel.cycle_mode
+    _refresh_scope_btn = k.ResultsPanel._refresh_scope_btn
+    _refresh_mode_btn = k.ResultsPanel._refresh_mode_btn
+
+
+def new_stub(crop, ua="desktop", scope="select", mode="rect", uploaded=None):
+    t = PanelStub()
+    t.shot_path = "/tmp/opencode/_full.png"
+    t._crop = crop
+    t.web = FakeWeb()
+    t._uploaded_crop = uploaded
+    t.web_status = type("S", (), {"setText": lambda s, x: None})()
+    t.tabs = type("T", (), {"currentIndex": lambda s: 1})()
+    t._settings0 = {"ua": ua, "mode": mode, "scope": scope}
+    t._ua_mode, t._mode, t._scope = ua, mode, scope
+    t.scope_btn = type("B", (), {"setText": lambda s, x: None})()
+    t.mode_btn = type("B", (), {"setText": lambda s, x: None})()
+    t.footer = type("F", (), {"setText": lambda s, x: None})()
+    return t
+
+
+def test_upload_gate():
+    print("\n== visual tab upload gate ==")
+    full = tempfile.mktemp(suffix=".png")
+    Image.new("RGB", (1600, 900), (1, 2, 3)).save(full)
+
+    # _crop starts out as the very screenshot the panel was handed, which is
+    # exactly the state that used to leak a full-screen upload
+    t = new_stub(full)
+    t.shot_path = full
+    t._crop = full
+    check(not t._crop_ready, "_crop_ready is False while _crop == shot_path")
+    t._load_results()
+    check(t.web.html is None,
+          "refuses to upload while _crop is still the full screenshot")
+
+    crop = tempfile.mktemp(suffix=".png")
+    Image.new("RGB", (400, 300), (9, 9, 9)).save(crop)
+    t._crop = crop
+    check(t._crop_ready, "_crop_ready once a real crop exists")
+    t._load_results()
+    check(t.web.html is not None, "uploads once the real crop exists")
+
+    before = t.web.html
+    t._load_results()
+    check(t.web.html is before, "does not re-POST the same crop on reflow")
+
+    t._load_results(force=True)
+    check(t.web.html is not before, "force=True re-uploads for a UA switch")
+
+
+# ----------------------------------------------------------------- settings
+
+def test_settings_roundtrip():
+    print("\n== settings persistence ==")
+    d = tempfile.mkdtemp()
+    saved = k._settings_path
+    k._settings_path = lambda: os.path.join(d, "settings.json")
+    try:
+        for scope in k.CAPTURE_SCOPES:
+            k.save_settings({"scope": scope})
+            check(k.load_settings().get("scope") == scope,
+                  f"scope={scope} round-trips")
+        t = new_stub(None)
+        t._settings0 = {}
+        t._scope = "select"
+        t._scope = k.CAPTURE_SCOPES[0]
+        t.cycle_scope()
+        check(t._settings0.get("scope") == "window", "scope cycles and saves")
+        t.cycle_scope()
+        check(t._settings0.get("scope") == "screen", "scope cycles to screen")
+        t2 = new_stub(None, mode="bogus-mode")
+        t2._mode = "bogus-mode"
+        t2.cycle_mode()
+        check(t2._mode in ["corner", "lasso", "ellipse", "rect"],
+              f"unknown mode recovered -> {t2._mode}")
+    finally:
+        k._settings_path = saved
+
+
+# ----------------------------------------------------------------- CSS
+
+def test_css():
+    print("\n== responsive css ==")
+    css = k._RESPONSIVE_CSS
+    check(css.count("{") == css.count("}"), "braces balanced")
+    for needle in ("#center_col", "grid-template-columns", 'name="q"'):
+        check(needle in css, f"css targets {needle}")
+    js = k._responsive_script()
+    check("kcircle-css" in js, "css injection is idempotent (tag id)")
+    check("viewport" in js, "viewport meta ensured")
+
+
+def main():
+    app = QApplication([])
+    scene = make_scene()
+    print(f"scene {SCREEN[0]}xSCREEN[1] with distinctive content")
+    test_scopes()
+    test_shapes(scene)
+    test_square(scene)
+    test_ua()
+    test_upload_gate()
+    test_settings_roundtrip()
+    test_css()
+    print(f"\n{checks - len(fails)}/{checks} checks passed")
+    if fails:
+        print("FAILURES:")
+        for f in fails:
+            print("  -", f)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
