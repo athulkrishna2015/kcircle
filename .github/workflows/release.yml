@@ -74,32 +74,3 @@ jobs:
             artifacts/*
           generate_release_notes: true
 
-  aur:
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-      - name: Push to AUR
-        env:
-          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
-        run: |
-          set -euo pipefail
-          ver="${GITHUB_REF_NAME#v}"
-          mkdir -p ~/.ssh
-          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
-          chmod 600 ~/.ssh/aur
-          printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  StrictHostKeyChecking no\n' > ~/.ssh/config
-          git clone ssh://aur@aur.archlinux.org/kcircle-bin.git aur 2>/dev/null || mkdir -p aur
-          cd aur 2>/dev/null || true
-          x86=$(grep -E "  kcircle-$ver-linux-x86_64\\.tar\\.gz$" ../artifacts/SHA256SUMS.txt | cut -d' ' -f1 || true)
-          arm=$(grep -E "  kcircle-$ver-linux-aarch64\\.tar\\.gz$" ../artifacts/SHA256SUMS.txt | cut -d' ' -f1 || true)
-          if [[ -f ../aur/PKGBUILD ]]; then cp ../aur/PKGBUILD PKGBUILD; fi
-          sed -i -e "s/@@VER@@/$ver/g" -e "s/@@X86@@/${x86:-0}/g" -e "s/@@ARM@@/${arm:-0}/g" PKGBUILD 2>/dev/null || true
-          if command -v makepkg >/dev/null 2>&1; then makepkg --printsrcinfo > .SRCINFO 2>/dev/null || true; fi
-          git add -A
-          git -c user.name="github-actions" -c user.email="actions@github.com" commit -m "Update to $ver-1" || true
-          git push || true
