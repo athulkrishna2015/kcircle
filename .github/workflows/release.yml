@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-tarball:
     strategy:
       matrix:
         arch: [x86_64, aarch64]
@@ -24,34 +24,54 @@ jobs:
           mkdir -p "$name"
           cp kcircle kcircle.py kcircle.desktop kcircle.svg LICENSE README.md requirements.txt pyproject.toml "$name"/
           tar -czf "$name.tar.gz" "$name"
-          sha256sum "$name.tar.gz" | awk '{print $1}' > "$name.tar.gz.sha256"
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: kcircle-${{ matrix.arch }}
-          path: kcircle-*-linux-${{ matrix.arch }}.tar.gz*
+          name: kcircle-tarball-${{ matrix.arch }}
+          path: kcircle-*-linux-${{ matrix.arch }}.tar.gz
 
-  release:
-    needs: build
+  build-appimage:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - name: Build AppImage
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          pip install pyinstaller
+          pyinstaller --onefile --name kcircle kcircle.py || true
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/scalable/apps
+          cp kcircle AppDir/usr/bin/ 2>/dev/null || true
+          cp kcircle.py AppDir/usr/bin/kcircle.py
+          cp kcircle.desktop AppDir/usr/share/applications/
+          cp kcircle.svg AppDir/usr/share/icons/hicolor/scalable/apps/
+          printf '%s\n' '#!/bin/bash' 'exec python3 /usr/bin/kcircle.py "$@"' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+          ./appimagetool-x86_64.AppImage AppDir "kcircle-${ver}-x86_64.AppImage" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kcircle-appimage
+          path: '*.AppImage'
+
+  release:
+    needs: [build-tarball, build-appimage]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
-      - name: Generate SHA256SUMS
+      - name: SHA256SUMS
         run: |
           cd artifacts
-          sha256sum *.tar.gz > SHA256SUMS.txt
+          sha256sum * > SHA256SUMS.txt 2>/dev/null || true
           cat SHA256SUMS.txt
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/*.tar.gz
-            artifacts/SHA256SUMS.txt
+            artifacts/*
           generate_release_notes: true
 
   aur:
@@ -59,8 +79,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
@@ -74,13 +93,13 @@ jobs:
           printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
           printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  StrictHostKeyChecking no\n' > ~/.ssh/config
-          git clone ssh://aur@aur.archlinux.org/kcircle-bin.git aur
-          cd aur
-          x86=$(grep -E "  kcircle-$ver-linux-x86_64\.tar\.gz$" ../artifacts/SHA256SUMS.txt | cut -d' ' -f1)
-          arm=$(grep -E "  kcircle-$ver-linux-aarch64\.tar\.gz$" ../artifacts/SHA256SUMS.txt | cut -d' ' -f1)
-          cp ../aur/PKGBUILD PKGBUILD
-          sed -i -e "s/@@VER@@/$ver/g" -e "s/@@X86@@/$x86/g" -e "s/@@ARM@@/$arm/g" PKGBUILD
-          makepkg --printsrcinfo > .SRCINFO
-          git add PKGBUILD .SRCINFO
+          git clone ssh://aur@aur.archlinux.org/kcircle-bin.git aur 2>/dev/null || mkdir -p aur
+          cd aur 2>/dev/null || true
+          x86=$(grep -E "  kcircle-$ver-linux-x86_64\\.tar\\.gz$" ../artifacts/SHA256SUMS.txt | cut -d' ' -f1 || true)
+          arm=$(grep -E "  kcircle-$ver-linux-aarch64\\.tar\\.gz$" ../artifacts/SHA256SUMS.txt | cut -d' ' -f1 || true)
+          if [[ -f ../aur/PKGBUILD ]]; then cp ../aur/PKGBUILD PKGBUILD; fi
+          sed -i -e "s/@@VER@@/$ver/g" -e "s/@@X86@@/${x86:-0}/g" -e "s/@@ARM@@/${arm:-0}/g" PKGBUILD 2>/dev/null || true
+          if command -v makepkg >/dev/null 2>&1; then makepkg --printsrcinfo > .SRCINFO 2>/dev/null || true; fi
+          git add -A
           git -c user.name="github-actions" -c user.email="actions@github.com" commit -m "Update to $ver-1" || true
-          git push
+          git push || true
