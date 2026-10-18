@@ -1240,6 +1240,9 @@ class ResultsPanel(QWidget):
         self._mode = self._settings0.get("mode", "rect")
         self._ua_mode = self._settings0.get("ua", "desktop")
         self._scope = self._settings0.get("scope", "select")
+        self._tab = self._settings0.get("tab", 1 if HAVE_WEBENGINE else 0)
+        if self._tab not in (0, 1) or (self._tab == 1 and not HAVE_WEBENGINE):
+            self._tab = 1 if HAVE_WEBENGINE else 0
         if self._scope not in CAPTURE_SCOPES:
             self._scope = "select"
         self.scope_btn = QPushButton()
@@ -1298,12 +1301,15 @@ class ResultsPanel(QWidget):
         else:
             self.stack.addWidget(QLabel("PyQt6-WebEngine not installed"))
 
-        self.tab_text.setChecked(True)
-        self.tab_text.clicked.connect(lambda: self.stack.setCurrentIndex(0))
-        self.tab_visual.clicked.connect(lambda: self._select_visual())
+        self.tab_text.setChecked(self._tab == 0)
+        self.tab_visual.setChecked(self._tab == 1)
+        self.tab_text.clicked.connect(lambda: self._set_tab(0))
+        self.tab_visual.clicked.connect(lambda: self._set_tab(1))
         # Image search is the main event - open on it.
-        if HAVE_WEBENGINE:
+        if self._tab == 1:
             self._select_visual()
+        else:
+            self.stack.setCurrentIndex(0)
 
         self.footer = QLabel("Esc close · drag title · corner resize")
         self.footer.setStyleSheet(f"color:{MUTED}; font-size:11px; padding:0 2px;")
@@ -1637,6 +1643,20 @@ class ResultsPanel(QWidget):
         self.stack.setCurrentIndex(1)
         self._on_tab(1)
 
+    def _set_tab(self, idx: int):
+        """Remember which results tab was last open, and show it.
+
+        The choice is written to settings.json so the tab the user last used
+        is the one reopened on the next launch.
+        """
+        self._tab = idx
+        self._settings0["tab"] = idx
+        save_settings(self._settings0)
+        if idx == 1:
+            self._select_visual()
+        else:
+            self.stack.setCurrentIndex(0)
+
     def _on_tab(self, idx):
         """Only pay for the embedded engine when the user asks for it."""
         if idx == 1 and self.web is not None:
@@ -1692,6 +1712,8 @@ class ResultsPanel(QWidget):
         if w is not None and w.isRunning():
             w.wait(1500)
         self.worker = None
+        self._settings0["tab"] = self._tab
+        save_settings(self._settings0)
         self._save_geometry()
         self.finished.emit()
         super().closeEvent(e)

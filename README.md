@@ -32,6 +32,7 @@ results land in a compact always-on-top panel.
   the way while you select.
 - **User-agent switch** between Google's mobile and desktop presentations,
   remembered between runs.
+- **Last tab** — Text or Visual matches, reopened on the next launch.
 - **Resizable and movable**, with position and size remembered.
 
 ## Capture scopes
