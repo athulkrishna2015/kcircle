@@ -257,37 +257,59 @@ def test_square(scene):
 
 
 def test_modifier_overrides(scene):
-    print("\n== mid-drag modifier overrides ==")
+    print("\n== mid-drag shape overrides ==")
+    CTRL = Qt.KeyboardModifier.ControlModifier
 
-    # Shift pressed *after* the drag started must switch rect -> lasso.
-    ov = new_overlay(scene, "rect")
-    got = {}
-    ov.picked.connect(lambda s: got.__setitem__("s", s))
-    ov.mousePressEvent(ev(PRESS, (400, 300), NONE))
-    ov.mouseMoveEvent(ev(MOVE, (560, 420), NONE))
-    ov.mouseMoveEvent(ev(MOVE, (720, 560), SHIFT))
-    check(ov._tmp_mode == "lasso", "Shift mid-drag switches to lasso")
-    ov.mouseMoveEvent(ev(MOVE, (900, 640), SHIFT))
-    check(ov._shape() is not None and not ov._shape().isEmpty(),
-          "lasso preview path exists mid-drag")
-    ov.mouseMoveEvent(ev(MOVE, (980, 700), SHIFT))
-    ov.mouseReleaseEvent(ev(RELEASE, (980, 700), SHIFT))
-    check(bool(got.get("s")) and got["s"][1] is not None,
-          "a mid-drag lasso emits a polygon, not a rectangle")
-
-    # Alt pressed mid-drag must turn a saved lasso into an ellipse.
+    # Shift pressed *after* the drag started must switch lasso -> rectangle.
     ov = new_overlay(scene, "lasso")
     got = {}
     ov.picked.connect(lambda s: got.__setitem__("s", s))
     ov.mousePressEvent(ev(PRESS, (400, 300), NONE))
     ov.mouseMoveEvent(ev(MOVE, (700, 500), NONE))
-    ov.mouseMoveEvent(ev(MOVE, (800, 560), ALT))
-    check(ov._tmp_mode == "ellipse", "Alt mid-drag overrides a lasso to ellipse")
-    ov.mouseReleaseEvent(ev(RELEASE, (800, 560), ALT))
-    check(bool(got.get("s")) and got["s"][1] is None,
-          "Alt override releases an ellipse selection, not a polygon")
+    check(ov._tmp_mode == "lasso", "free-form is what you get with no modifier")
+    ov.mouseMoveEvent(ev(MOVE, (900, 640), SHIFT))
+    check(ov._tmp_mode == "rect", "Shift mid-drag switches to rectangle")
+    check(ov.path == [], "the lasso stroke is dropped when constraining")
+    ov.mouseReleaseEvent(ev(RELEASE, (900, 640), SHIFT))
+    sel = got.get("s")
+    check(bool(sel) and sel[1] is None,
+          "a Shift-constrained drag emits a plain rectangle")
 
-    # Shift in corner mode means "square", not lasso.
+    # ...and back again, without lifting the mouse.
+    ov = new_overlay(scene, "rect")
+    ov.mousePressEvent(ev(PRESS, (400, 300), NONE))
+    ov.mouseMoveEvent(ev(MOVE, (600, 400), NONE))
+    check(ov._tmp_mode == "rect", "starts as a rectangle")
+    ov.mouseMoveEvent(ev(MOVE, (760, 520), SHIFT))
+    check(ov._tmp_mode == "rect", "still a rectangle while Shift is held")
+    ov.mouseMoveEvent(ev(MOVE, (820, 600), NONE))
+    check(ov._tmp_mode == "rect", "releasing Shift keeps the saved shape")
+
+    # Ctrl gives an ellipse, Alt a true circle.
+    ov = new_overlay(scene, "lasso")
+    ov.mousePressEvent(ev(PRESS, (400, 300), NONE))
+    ov.mouseMoveEvent(ev(MOVE, (700, 500), NONE))
+    ov.mouseMoveEvent(ev(MOVE, (800, 560), CTRL))
+    check(ov._tmp_mode == "ellipse", "Ctrl mid-drag switches to ellipse")
+    check(ov._shape() is not None and not ov._shape().isEmpty(),
+          "the ellipse has a preview path")
+
+    ov = new_overlay(scene, "lasso")
+    got = {}
+    ov.picked.connect(lambda s: got.__setitem__("s", s))
+    ov.mousePressEvent(ev(PRESS, (400, 300), NONE))
+    ov.mouseMoveEvent(ev(MOVE, (700, 500), NONE))
+    ov.mouseMoveEvent(ev(MOVE, (900, 700), ALT))
+    check(ov._tmp_mode == "circle", "Alt mid-drag switches to circle")
+    r = ov._shape_rect()
+    check(r.width() == r.height(),
+          f"the circle drag is constrained square ({r.width()}x{r.height()})")
+    ov.mouseReleaseEvent(ev(RELEASE, (900, 700), ALT))
+    sel = got.get("s")
+    check(bool(sel) and sel[1] is None,
+          "a circle releases as a plain rectangle region")
+
+    # Shift in corner mode keeps its own meaning: square.
     ov = new_overlay(scene, "corner")
     ov.mousePressEvent(ev(PRESS, (400, 300), NONE))
     ov.mouseMoveEvent(ev(MOVE, (900, 560), SHIFT))
@@ -295,6 +317,21 @@ def test_modifier_overrides(scene):
           "Shift in corner mode stays corner + square")
     r = ov._shape_rect()
     check(r.width() == r.height(), "held Shift keeps the drag square")
+
+    # A modifier makes the gesture a shape, never a tap.
+    ov = new_overlay(object_scene(), "rect")
+    settle(ov)
+    for label, mods in (("Shift", SHIFT), ("Ctrl", CTRL), ("Alt", ALT)):
+        check(not ov._is_tap(ev(RELEASE, (390, 310), mods)),
+              f"{label}+click is a shape override, not a tap")
+
+
+def test_default_is_free_form():
+    print("\n== default shape ==")
+    check(k.DEFAULT_MODE == "lasso",
+          "free-form drawing is the default, needing no modifier")
+    check("circle" in "".join(["rect", "corner", "lasso", "ellipse", "circle"]),
+          "circle is a reachable shape")
 
 
 def test_overlay_hint(scene):

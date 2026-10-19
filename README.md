@@ -38,8 +38,21 @@ results land in a compact always-on-top panel.
   scribble the bag.
 - **Scribble to search.** Draw a loose loop around one thing and it snaps to
   that thing. A big deliberate lasso is always honoured exactly as drawn.
-- **Four selection shapes** — `corner`, `rect`, `lasso`, `ellipse` — with the
-  choice remembered between runs. Hold Shift in `corner` mode for a square.
+- **Free-form by default.** Circling by hand is what Circle to Search is named
+  for, so that is what you get with nothing held.
+- **Change shape without lifting the mouse.** Hold a modifier at any point
+  mid-drag and the selection becomes exactly that shape:
+
+  | Held | Shape |
+  | --- | --- |
+  | *nothing* | free-form lasso |
+  | `Shift` | rectangle |
+  | `Ctrl` | ellipse |
+  | `Alt` | circle |
+  | `Shift` in `corner` mode | square |
+
+  Release it and you are back to your saved shape. The choice of saved shape —
+  `lasso`, `ellipse`, `circle`, `rect` or `corner` — is remembered between runs.
 - **Three capture scopes** — draw a region, grab the active window, or take
   the whole screen.
 - **Reusable.** The `+` button starts another capture; the panel gets out of
@@ -261,7 +274,7 @@ Command: /path/to/kcircle/kcircle
 
 | File | Purpose |
 | --- | --- |
-| `settings.json` | `{"ua": "desktop"\|"mobile", "mode": "corner"\|"rect"\|"lasso"\|"ellipse", "scope": "select"\|"window"\|"screen", "snap": true, "autocopy": false}` |
+| `settings.json` | `{"ua": "desktop"\|"mobile", "mode": "lasso"\|"ellipse"\|"circle"\|"rect"\|"corner", "scope": "select"\|"window"\|"screen", "snap": true, "autocopy": false}` |
 | `geometry.json` | panel position and size |
 | `kcircle.log` | debug log, see below |
 

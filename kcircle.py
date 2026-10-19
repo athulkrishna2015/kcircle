@@ -419,6 +419,10 @@ OBJ_PAD = 0.004
 TAP_SLOP = 8
 TAP_MS = 450
 
+# Free-form first: circling by hand is what Circle to Search is named for and
+# it needs no modifier at all. Everything more precise is one keystroke away.
+DEFAULT_MODE = "lasso"
+
 # How long the pointer stays hidden after the overlay opens. Long
 # enough to cover the swap to the frozen frame, short enough that it is
 # already back before the user starts aiming at something.
@@ -842,9 +846,10 @@ class SelectionOverlay(QWidget):
         self.current = None
         self.path = []            # lasso points, in widget coords
         settings = load_settings()
-        self.mode = settings.get("mode", "rect")
+        self.mode = settings.get("mode", DEFAULT_MODE)
         self._tmp_mode = None
         self._square = False
+        self._circle = False
 
         # Tap targets and scribble snapping. Both are heuristics over the
         # frozen screenshot, and both are strictly an accelerator: every one of
@@ -888,15 +893,16 @@ class SelectionOverlay(QWidget):
         mode_label = {
             "rect": "rectangle",
             "corner": "corner to corner",
-            "lasso": "circle / lasso",
+            "lasso": "free-form lasso",
             "ellipse": "ellipse",
-        }.get(self.mode, "rectangle")
+            "circle": "circle",
+        }.get(self.mode, "free-form lasso")
 
         # Parented to the overlay: a parentless QLabel is a top-level window and
         # would never be shown, so the hint silently never appeared before.
         hint = QLabel(
-            f"{mode_label}  ·  click an object  ·  Shift = square / lasso"
-            "  ·  Alt = ellipse  ·  Esc to cancel",
+            f"{mode_label}  ·  click an object  ·  hold Shift = rectangle"
+            "  ·  Ctrl = ellipse  ·  Alt = circle  ·  Esc to cancel",
             self,
         )
         hint.setStyleSheet("color:#ffffff; background:#000000aa; padding:6px 12px;")
@@ -1003,18 +1009,24 @@ class SelectionOverlay(QWidget):
 
     # painting ---------------------------------------------------------
     def _effective_mode(self, mods):
-        """Resolve the selection mode for a given modifier state.
+        """Resolve the selection shape for a given modifier state.
 
-        Held modifiers override the saved mode: Shift -> lasso, Alt -> ellipse.
-        In corner mode Shift is left free so it can mean "square" instead.
+        With nothing held you get the saved shape, which defaults to a free-form
+        lasso - the gesture Circle to Search is actually named for. Any modifier
+        pressed *during* the drag overrides it, so you can start scribbling and
+        tighten up to an exact shape without lifting the mouse.
 
-        This is evaluated on every mouse event, not just on press, so the
-        documented mid-drag overrides actually take effect.
+        Re-evaluated on every mouse event rather than fixed at press, which is
+        what makes switching mid-stroke work.
         """
         if mods & Qt.KeyboardModifier.AltModifier:
+            return "circle"
+        if mods & Qt.KeyboardModifier.ControlModifier:
             return "ellipse"
-        if (mods & Qt.KeyboardModifier.ShiftModifier) and self.mode != "corner":
-            return "lasso"
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            if self.mode == "corner":
+                return "corner"           # Shift still means "square" here
+            return "rect"
         return self.mode
 
     def _shape_rect(self):
@@ -1026,6 +1038,11 @@ class SelectionOverlay(QWidget):
             left = ax if self.current.x() >= ax else ax - side
             top = ay if self.current.y() >= ay else ay - side
             rect = QRect(left, top, side, side)
+        elif self._circle:
+            # a true circle: force the shorter axis up to the longer one
+            side = max(rect.width(), rect.height())
+            cx, cy = rect.center().x(), rect.center().y()
+            rect = QRect(cx - side // 2, cy - side // 2, side, side)
         return rect
 
     def paintEvent(self, _):
@@ -1079,7 +1096,7 @@ class SelectionOverlay(QWidget):
 
         rect = QRectF(self._shape_rect())
         path = QPainterPath()
-        if mode == "ellipse":
+        if mode in ("ellipse", "circle"):
             path.addEllipse(rect)
         else:
             path.addRect(rect)
@@ -1091,8 +1108,10 @@ class SelectionOverlay(QWidget):
             self.cancelled.emit()
             return
         self._tmp_mode = self._effective_mode(e.modifiers())
-        # Shift in corner/rect mode means "square"
-        self._square = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        # Constraints follow the resolved shape, not the raw modifier: in corner
+        # mode Shift means "square", elsewhere it just means "rectangle".
+        self._square = self._tmp_mode == "corner"
+        self._circle = self._tmp_mode == "circle"
         if self._tmp_mode == "lasso":
             self.path = [e.position().toPoint()]
         self.origin = e.position().toPoint()
@@ -1108,7 +1127,8 @@ class SelectionOverlay(QWidget):
         # Re-resolve the mode on every move: the README promises Shift/Alt
         # overrides mid-drag, and _tmp_mode was previously frozen at press.
         self._tmp_mode = self._effective_mode(e.modifiers())
-        self._square = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        self._square = self._tmp_mode == "corner"
+        self._circle = self._tmp_mode == "circle"
         self.current = e.position().toPoint()
         self.glow.spark = QPointF(e.position())
         if self._tmp_mode == "lasso":
@@ -1189,6 +1209,7 @@ class SelectionOverlay(QWidget):
     def _is_tap(self, e):
         mods = e.modifiers()
         if mods & (Qt.KeyboardModifier.ShiftModifier
+                   | Qt.KeyboardModifier.ControlModifier
                    | Qt.KeyboardModifier.AltModifier):
             return False          # a modifier is an explicit shape override
         if self.origin is None:
@@ -1223,6 +1244,7 @@ class SelectionOverlay(QWidget):
         self.origin = self.current = None
         self.path = []
         self._square = False
+        self._circle = False
         self._tmp_mode = None
         self._glow_timer.stop()
         self.glow.clear()
@@ -1971,7 +1993,7 @@ class ResultsPanel(QWidget):
             "(in corner mode Shift means square instead)."
         )
         self._settings0 = load_settings()
-        self._mode = self._settings0.get("mode", "rect")
+        self._mode = self._settings0.get("mode", DEFAULT_MODE)
         self._snap = bool(self._settings0.get("snap", True))
         # Opt-in: overwriting the clipboard unasked can lose work.
         self._autocopy = bool(self._settings0.get("autocopy", False))
@@ -2325,12 +2347,13 @@ class ResultsPanel(QWidget):
             "corner": "◱ corner",
             "lasso": "◯ lasso",
             "ellipse": "⬭ ellipse",
+            "circle": "◯ circle",
         }
         self.mode_btn.setText("Shape: " + names.get(self._mode, self._mode))
 
     def cycle_mode(self):
         """Persist the selection style so the next launch starts with it."""
-        order = ["corner", "lasso", "ellipse", "rect"]
+        order = ["lasso", "ellipse", "circle", "rect", "corner"]
         # settings.json may hold a mode this build no longer knows
         if self._mode not in order:
             self._mode = order[0]
