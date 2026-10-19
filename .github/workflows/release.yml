@@ -57,7 +57,7 @@ jobs:
           uv pip install --python "$PWD/AppDir/venv/bin/python" \
             -r requirements.txt
 
-          mkdir -p AppDir/usr/share/applications \
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications \
                    AppDir/usr/share/icons/hicolor/scalable/apps
           cp kcircle.py AppDir/usr/bin/kcircle.py
           cp kcircle.desktop AppDir/usr/share/applications/
