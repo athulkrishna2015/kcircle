@@ -891,6 +891,57 @@ def test_header_fits_min_width():
     panel.close()
 
 
+def test_super_copies_without_opening_the_panel():
+    print("\n== Super copies the text and opens nothing ==")
+    # Shift, Ctrl and Alt were already spoken for by the shape keys, so Super
+    # is the one left. It is orthogonal: it changes what happens on release,
+    # not how the stroke is drawn, so it composes with all three shapes.
+    ov = k.SelectionOverlay("/tmp/opencode/kcircle-overlay.png")
+    M = Qt.KeyboardModifier
+    cases = (
+        ("nothing", M.NoModifier, "lasso", False),
+        ("Shift", M.ShiftModifier, "rect", False),
+        ("Ctrl", M.ControlModifier, "ellipse", False),
+        ("Alt", M.AltModifier, "circle", False),
+        ("Super", M.MetaModifier, "lasso", True),
+        ("Super+Shift", M.MetaModifier | M.ShiftModifier, "rect", True),
+        ("Super+Ctrl", M.MetaModifier | M.ControlModifier, "ellipse", True),
+        ("Super+Alt", M.MetaModifier | M.AltModifier, "circle", True),
+    )
+    for label, mods, shape, copy in cases:
+        check(ov._effective_mode(mods) == shape,
+              f"{label} selects the {shape} shape")
+        check(ov._is_copy_only(mods) == copy,
+              f"{label} "
+              f"{'copies without a panel' if copy else 'opens the panel'}")
+    # Super alone must not quietly become a shape of its own
+    check(ov._effective_mode(M.MetaModifier) == ov.mode,
+          "Super on its own leaves the saved shape alone")
+    ov.close()
+
+
+def test_copy_only_never_opens_a_panel():
+    print("\n== copy-only never builds a panel ==")
+    # The whole point is not opening the UI, so the handler that does the copy
+    # must not construct ResultsPanel at all.
+    main_src = _code_only(open("kcircle.py").read())
+    start = main_src.index("def on_copy_only")
+    end = main_src.index("def on_copied")
+    handler = main_src[start:end]
+    check("ResultsPanel" not in handler,
+          "the copy-only handler does not construct a panel")
+    check("show_panel" not in handler,
+          "the copy-only handler does not open the results panel")
+    check("LensWorker" in handler,
+          "the copy-only handler runs the same OCR as the panel")
+    check("clipboard" in main_src[main_src.index("def on_copied"):
+                                  main_src.index("def on_copy_failed")],
+          "the decoded text is put on the clipboard")
+    # auto-copy must not gate it: holding Super is already the request
+    check("_autocopy" not in handler,
+          "copy-only does not consult the auto-copy setting")
+
+
 def test_ua():
     print("\n== user agents ==")
     check(set(k.UA_PRESETS) == {"mobile", "desktop"}, "both presets defined")
@@ -1284,6 +1335,8 @@ def main():
     test_switch_modifier_mid_drag()
     test_minimize_keeps_the_panel()
     test_launching_always_captures()
+    test_super_copies_without_opening_the_panel()
+    test_copy_only_never_opens_a_panel()
     test_single_header_row()
     test_title_yields_to_the_url()
     test_controls_survive_the_tab_switch()

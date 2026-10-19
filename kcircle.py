@@ -811,6 +811,9 @@ class SelectionOverlay(QWidget):
     """Fullscreen, frameless. Shows the frozen screen; user drags a box."""
 
     picked = pyqtSignal(tuple)   # (x1, y1, x2, y2) normalised 0..1
+    # Same payload as picked(), but the caller should put the text on the
+    # clipboard and stop there - no panel is opened.
+    copyOnly = pyqtSignal(tuple)
     cancelled = pyqtSignal()
     missed = pyqtSignal()         # a tap that matched no object
 
@@ -907,7 +910,8 @@ class SelectionOverlay(QWidget):
         # would never be shown, so the hint silently never appeared before.
         hint = QLabel(
             f"{mode_label}  ·  click an object  ·  hold Shift = rectangle"
-            "  ·  Ctrl = ellipse  ·  Alt = circle  ·  Esc to cancel",
+            "  ·  Ctrl = ellipse  ·  Alt = circle  ·  Super = copy text"
+            "  ·  Esc to cancel",
             self,
         )
         hint.setStyleSheet("color:#ffffff; background:#000000aa; padding:6px 12px;")
@@ -1034,6 +1038,17 @@ class SelectionOverlay(QWidget):
             return "rect"
         return self.mode
 
+    @staticmethod
+    def _is_copy_only(mods) -> bool:
+        """Super held: read the selection, copy it, and stop.
+
+        Super is the one modifier the shape keys do not use - Shift, Ctrl and
+        Alt already mean rectangle, ellipse and circle - so it combines with
+        any of them without changing the shape. It changes what happens on
+        release, not how the stroke is drawn.
+        """
+        return bool(mods & Qt.KeyboardModifier.MetaModifier)
+
     def _shape_rect(self):
         rect = QRect(self.origin, self.current).normalized()
         if self._square:
@@ -1113,6 +1128,7 @@ class SelectionOverlay(QWidget):
             self.cancelled.emit()
             return
         self._tmp_mode = self._effective_mode(e.modifiers())
+        self._tmp_copy = self._is_copy_only(e.modifiers())
         # Constraints follow the resolved shape, not the raw modifier: in corner
         # mode Shift means "square", elsewhere it just means "rectangle".
         self._square = self._tmp_mode == "corner"
@@ -1132,6 +1148,8 @@ class SelectionOverlay(QWidget):
         # Re-resolve the mode on every move: the README promises Shift/Alt
         # overrides mid-drag, and _tmp_mode was previously frozen at press.
         self._tmp_mode = self._effective_mode(e.modifiers())
+        # Live too: you can start scribbling and press Super a moment later.
+        self._tmp_copy = self._is_copy_only(e.modifiers())
         self._square = self._tmp_mode == "corner"
         self._circle = self._tmp_mode == "circle"
         self.current = e.position().toPoint()
@@ -1151,14 +1169,18 @@ class SelectionOverlay(QWidget):
             return
         self.current = e.position().toPoint()
         mode = self._tmp_mode or self.mode
+        # Super can be released just before the mouse, so fold in whatever the
+        # release event itself says.
+        copy_only = self._tmp_copy or self._is_copy_only(e.modifiers())
         self._tmp_mode = None
+        self._tmp_copy = False
         self._glow_timer.stop()
 
         # A press and release that barely moved is a tap, not a drag. Handle it
         # before any shape logic, in every mode: on Android you tap whatever
         # shape the tool happens to be in and still get the object.
         if self._is_tap(e):
-            self._handle_tap()
+            self._handle_tap(copy_only)
             return
 
         if mode == "lasso":
@@ -1195,11 +1217,11 @@ class SelectionOverlay(QWidget):
                     if logg:
                         logg.info("scribble snapped to object %s", snapped.rect)
                     self._reset()
-                    self.picked.emit((snapped.rect, None))
+                    self._emit((snapped.rect, None), copy_only)
                     return
 
             self._reset()
-            self.picked.emit((rect, poly))
+            self._emit((rect, poly), copy_only)
             return
 
         rect = self._shape_rect()
@@ -1209,7 +1231,7 @@ class SelectionOverlay(QWidget):
         norm = (rect.left() / self.width(), rect.top() / self.height(),
                 rect.right() / self.width(), rect.bottom() / self.height())
         self._reset()
-        self.picked.emit((norm, None))
+        self._emit((norm, None), copy_only)
 
     def _is_tap(self, e):
         mods = e.modifiers()
@@ -1225,7 +1247,14 @@ class SelectionOverlay(QWidget):
         elapsed = (time.monotonic() - self._press_t) * 1000.0
         return elapsed <= TAP_MS
 
-    def _handle_tap(self):
+    def _emit(self, payload, copy=None):
+        """Deliver a finished selection, as a copy or as a search."""
+        if copy if copy is not None else getattr(self, "_tmp_copy", False):
+            self.copyOnly.emit(payload)
+        else:
+            self.picked.emit(payload)
+
+    def _handle_tap(self, copy=False):
         """Turn a tap into a selection of whatever object it landed on."""
         nx = self.current.x() / float(max(1, self.width()))
         ny = self.current.y() / float(max(1, self.height()))
@@ -1235,7 +1264,7 @@ class SelectionOverlay(QWidget):
             if logg:
                 logg.info("tap selected object %s (score %.2f)", box.rect,
                           box.score)
-            self.picked.emit((box.rect, None))
+            self._emit((box.rect, None), copy)
             return
         # No object under the finger. Rather than refuse the gesture, fall back
         # to a small box around the tap: on a dense page the detector has
@@ -1243,7 +1272,7 @@ class SelectionOverlay(QWidget):
         if logg:
             logg.info("tap hit no object; using a small box at %.3f,%.3f",
                       nx, ny)
-        self.picked.emit((self._tap_rect(nx, ny), None))
+        self._emit((self._tap_rect(nx, ny), None), copy)
 
     def _reset(self):
         self.origin = self.current = None
@@ -1251,6 +1280,7 @@ class SelectionOverlay(QWidget):
         self._square = False
         self._circle = False
         self._tmp_mode = None
+        self._tmp_copy = False
         self._glow_timer.stop()
         self.glow.clear()
         self.update()
@@ -2935,6 +2965,58 @@ def main():
                       *region, f"{len(poly)}pts" if poly else "none")
             show_panel(shot, region, poly)
 
+        def on_copy_only(selection):
+            """Super was held: copy the text and show nothing else.
+
+            Deliberately independent of the auto-copy setting - holding Super
+            is an explicit request to copy, and a panel would defeat the point.
+            """
+            state["overlay"] = None
+            ov.close()
+            region, poly = selection
+            logg.info("copy-only region=%.3f,%.3f-%.3f,%.3f poly=%s",
+                      *region, f"{len(poly)}pts" if poly else "none")
+            worker = LensWorker(shot, region, translate_to, poly)
+            _ACTIVE_WORKERS.add(worker)
+            worker.done.connect(lambda r: on_copied(r, worker))
+            worker.failed.connect(lambda m: on_copy_failed(m, worker))
+            worker.finished.connect(lambda: _ACTIVE_WORKERS.discard(worker))
+            worker.start()
+
+        def on_copied(r, worker):
+            parts = []
+            # A decoded code is the most reliable text there is, so it leads.
+            for fmt, value in (r.get("_barcodes") or []):
+                label = fmt.replace("BarcodeFormat.", "") if fmt else "code"
+                parts.append(f"[{label}]  {value}")
+            ocr = (r.get("ocr_text") or "").strip()
+            if ocr:
+                parts.append(ocr)
+            tr = (r.get("translated_text") or "").strip()
+            if tr and tr != ocr:
+                parts.append(f"— translated —\n{tr}")
+            if not parts:
+                notify("No text found", "Nothing readable in that selection.")
+                return
+            payload = "\n".join(parts)
+            QApplication.clipboard().setText(payload)
+            logg.info("copy-only: %d characters to the clipboard",
+                      len(payload))
+            notify(f"Copied {len(payload)} characters",
+                   payload[:120].replace("\n", " "))
+
+        def on_copy_failed(message, worker):
+            logg.error("copy-only failed: %s", message)
+            notify("Copy failed", str(message)[:160])
+
+        def notify(title, body):
+            """Say it happened - with no panel, silence would look broken."""
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                tray.showMessage("Circle to Search", f"{title}\n{body}",
+                                 QSystemTrayIcon.MessageIcon.Information, 2500)
+            else:
+                logg.info("copy-only: %s - %s", title, body)
+
         def on_cancel():
             state["overlay"] = None
             logg.info("cancelled by user")
@@ -2946,6 +3028,7 @@ def main():
                 app.quit()
 
         ov.picked.connect(on_pick)
+        ov.copyOnly.connect(on_copy_only)
         ov.cancelled.connect(on_cancel)
         ov.show()
         # Esc must work even if KWin refuses us keyboard focus, so grab the key

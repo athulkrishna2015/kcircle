@@ -46,6 +46,8 @@ as a browser would render it.
 
 - **Works on any application.** Capture is compositor-level, not
   browser-level.
+- **Copy text without opening anything.** Hold Super while you draw and the
+  text goes straight to the clipboard — no panel, no window.
 - **True Circle to Search.** Draw a lasso around a subject and the crop is
   masked to your stroke and trimmed tight, so Lens sees the thing you circled
   rather than the whole screen around it.
@@ -111,6 +113,41 @@ as a browser would render it.
   remembered between runs.
 - **Last tab** — Text or Visual matches, reopened on the next launch.
 - **Resizable and movable**, with position and size remembered.
+
+## Copy text without opening anything
+
+Hold **Super** while you draw and the text under your stroke goes straight to
+the clipboard. No panel, no window, no interruption.
+
+It uses Super because Shift, Ctrl and Alt are already taken by the shape keys.
+Super is orthogonal to them — it changes what happens when you let go, not how
+the stroke is drawn — so every shape still works:
+
+| Held | Shape | What happens on release |
+| --- | --- | --- |
+| — | your saved shape (free-form lasso by default) | open the results panel |
+| `Shift` | rectangle | open the results panel |
+| `Ctrl` | ellipse | open the results panel |
+| `Alt` | circle | open the results panel |
+| `Super` | your saved shape | **copy the text, open nothing** |
+| `Super`+`Shift` | rectangle | **copy the text, open nothing** |
+| `Super`+`Ctrl` | ellipse | **copy the text, open nothing** |
+| `Super`+`Alt` | circle | **copy the text, open nothing** |
+
+It works on a tap too, and on a scribble that snaps to an object. You can press
+or release Super mid-drag, exactly like the shape keys.
+
+Decoded QR and barcode values come first, then the recognised text, then the
+translation if one was asked for — the same order **Copy text** uses.
+
+This path ignores the **auto-copy** setting. Holding Super is already the
+request to copy, and silently doing nothing because a separate toggle is off
+would be the wrong answer. Auto-copy remains off by default for the normal
+path, where it would replace your clipboard unasked.
+
+Since no panel appears, a tray notification reports what happened — how much
+was copied, or that nothing readable was found. Without it, silence would look
+identical to a failed gesture.
 
 ## Tap and scribble
 
@@ -516,7 +553,7 @@ hand and see that icon, add the line.
 
 ## Tests
 
-A local matrix of 251 checks covers every scope, shape and user-agent
+A local matrix of 273 checks covers every scope, shape and user-agent
 combination, and asserts the invariants that have actually broken:
 
 - a selection never uploads the whole screenshot, and the visual tab never
