@@ -2887,7 +2887,7 @@ def main():
     # no visible affordance - it would simply vanish, which is worse than not
     # offering the option at all.
     tray = QSystemTrayIcon(_tray_icon(), app)
-    tray.setToolTip("Circle to Search")
+    tray.setToolTip("Circle to Search — click to search, right-click for more")
     tray_menu = QMenu()
     tray_menu.addAction("Restore panel", restore_panel)
     # Resolved at click time, by which point begin_capture is defined below.
@@ -2895,11 +2895,20 @@ def main():
     tray_menu.addSeparator()
     tray_menu.addAction("Quit", app.quit)
     tray.setContextMenu(tray_menu)
-    tray.activated.connect(
-        lambda reason: restore_panel()
+    # Left click is the one click that should do something useful: start a new
+    # search. It used to only restore a minimized panel, which meant the tray
+    # was a passive "get my window back" button and nothing more.
+    #
+    # Right click is untouched - Qt raises the menu above on its own, so
+    # restoring a minimized panel is still one right click away. That matters:
+    # with left click taken over, the menu is now the only route back to a
+    # panel the user did not mean to replace.
+    def on_tray_activated(reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger,
-                      QSystemTrayIcon.ActivationReason.DoubleClick)
-        else None)
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            begin_capture()
+
+    tray.activated.connect(on_tray_activated)
     if QSystemTrayIcon.isSystemTrayAvailable():
         tray.show()
     else:

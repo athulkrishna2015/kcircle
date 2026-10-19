@@ -942,6 +942,35 @@ def test_copy_only_never_opens_a_panel():
           "copy-only does not consult the auto-copy setting")
 
 
+def test_tray_left_click_searches():
+    print("\n== the tray's left click starts a search ==")
+    # It used to only restore a minimized panel, which made the tray a passive
+    # "get my window back" button. Right click must still raise the menu, and
+    # the menu must still be the way back to a panel the user did not mean to
+    # replace - otherwise minimizing has become a one-way door.
+    # Read raw source: _code_only joins tokens with spaces, which would break
+    # every dotted name this test looks for.
+    raw = open("kcircle.py").read()
+    tray = raw[raw.index("tray = QSystemTrayIcon"):raw.index("def begin_capture")]
+    handler = raw[raw.index("def on_tray_activated"):
+                  raw.index("tray.activated.connect")]
+    check("begin_capture" in handler,
+          "a left click starts a new search")
+    check("restore_panel" not in handler,
+          "a left click no longer just restores the panel")
+    check("ActivationReason.Trigger" in handler
+          and "ActivationReason.DoubleClick" in handler,
+          "both single and double click are treated the same")
+    check("setContextMenu" in tray,
+          "right click still raises the tray menu")
+    check('addAction("Restore panel", restore_panel)' in tray,
+          "the menu still restores a minimized panel")
+    check('addAction("New search"' in tray,
+          "the menu can also start a new search")
+    check("click to search" in raw,
+          "the tooltip says what a left click does")
+
+
 def test_ua():
     print("\n== user agents ==")
     check(set(k.UA_PRESETS) == {"mobile", "desktop"}, "both presets defined")
@@ -1335,6 +1364,7 @@ def main():
     test_switch_modifier_mid_drag()
     test_minimize_keeps_the_panel()
     test_launching_always_captures()
+    test_tray_left_click_searches()
     test_super_copies_without_opening_the_panel()
     test_copy_only_never_opens_a_panel()
     test_single_header_row()

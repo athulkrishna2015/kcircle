@@ -255,6 +255,12 @@ The panel remembers its size and position across runs. It is written on a
 400 ms debounce after any resize rather than only when the panel closes, so a
 resize survives a crash or a kill.
 
+Clicking the **tray icon** starts a new search — the same gesture as pressing
+the shortcut. Right-click still raises the usual menu: **Restore panel**,
+**New search**, **Quit**. Restore lives there now on purpose, because with left
+click starting a search it is the only route back to a panel you did not mean
+to replace.
+
 Right-clicking the results gives the usual browser menu — Back, Forward,
 Reload, Copy, Copy link address, Save page, and open/save link in a new tab or
 window. It is built from QtWebEngine's own `WebAction` values, because PyQt 6
@@ -553,7 +559,7 @@ hand and see that icon, add the line.
 
 ## Tests
 
-A local matrix of 273 checks covers every scope, shape and user-agent
+A local matrix of 280 checks covers every scope, shape and user-agent
 combination, and asserts the invariants that have actually broken:
 
 - a selection never uploads the whole screenshot, and the visual tab never
