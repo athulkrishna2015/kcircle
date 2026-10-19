@@ -317,6 +317,12 @@ uv pip install -r requirements.txt
 
 `./kcircle` is a thin launcher that execs the checkout's own `.venv`.
 
+There are no binary releases and no packages. An AppImage was attempted and
+removed: bundling PyQt6 and QtWebEngine into one file is a packaging project
+of its own, and shipping an image whose launcher called the system `python3`
+would have produced something that could not import PyQt6 on any machine. A
+clone and `uv run` is the honest answer for a Wayland desktop app.
+
 ### Dependencies
 
 | Package | Why |
