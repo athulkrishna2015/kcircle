@@ -12,6 +12,36 @@ kcircle brings the gesture to the whole desktop. Freeze the screen, draw around
 anything — a PDF, a video, a terminal, a photo on your desktop — and the
 results land in a compact always-on-top panel.
 
+## Screenshots
+
+**Free-form lasso** — the default gesture. Draw a shape around anything; the
+crop is masked to your stroke and trimmed tight, so Lens sees what you circled
+rather than the screen around it.
+
+![Free-form lasso around a desktop wallpaper](docs/freeform-lasso.png)
+
+**Tap or scribble** — a short stroke is not a mistake. Point at something and
+click to search that object, or scribble over a run of text and it is read
+directly. Either way the region is found by layout analysis of the frozen
+frame: no model, no extra dependency.
+
+![Tap-to-search detecting an object in a browser window](docs/scribble-detect.png)
+
+**Text** — server-side OCR through Google's own endpoint, so every script and
+font works and your CPU stays idle. Selectable, and copied to the clipboard
+automatically if you ask for it.
+
+![The Text tab with recognised text and a thumbnail](docs/text-tab.png)
+
+**Visual matches** — the full Lens result set in an embedded view, left exactly
+as a browser would render it.
+
+![Visual matches with an AI Overview](docs/visual-matches.png)
+
+> These predate the navigation bar and the two-row header, so their toolbars
+> show the older layout. The gestures and the results they demonstrate are
+> unchanged.
+
 ## Features
 
 - **Works on any application.** Capture is compositor-level, not
@@ -22,9 +52,13 @@ results land in a compact always-on-top panel.
 - **Animated glow** while you draw: a soft halo, a bright core, a comet tail
   and a spark that rides the cursor.
 - **Real Google Lens results** — AI Overview, Exact matches, Visual matches —
-  rendered in an embedded view, not a browser window, with Google's own
-  search box left in place so you can refine a query without leaving the
-  panel.
+  rendered in an embedded view, not a browser window, and left completely
+  untouched: no CSS, no JavaScript, no zoom. What you see is what a browser
+  would show.
+- **Browse the results, don't just stare at them.** Back, forward, reload, a
+  history dropdown of every URL visited in the panel, an editable URL bar, and
+  the standard right-click menu — save a page, copy a link address, open a link
+  in a new tab.
 - **Text in any language.** Scribble over a run of text and it is read by
   Google's own OCR server-side, so every script and font works and your CPU
   does nothing. The result is selectable and copyable.
@@ -520,10 +554,11 @@ official feature does.
   or crashes (some distro Qt/PyQt6 combinations abort on load), kcircle detects
   that in a subprocess at startup and falls back to OCR-only rather than
   crashing.
-- **There are no screenshots in this repository, by design.** A screen capture
-  of the results panel leaked this machine's geolocation. `docs/` and all image
-  types are gitignored, and the image generator writes to `/tmp` — so a
-  screenshot of your own session can never be committed by accident.
+- **Screenshots live in `docs/` and nowhere else.** Images are blocked by
+  `.gitignore` everywhere except `docs/`, so a screen capture taken while
+  working cannot be committed by accident — this bit once, when a results
+  panel was committed and leaked the machine's location. The images in
+  `docs/` are deliberate, reviewed, and re-checked before every release.
 
 ## License
 

@@ -5,8 +5,11 @@ __pycache__/
 dist/
 build/
 
-# never commit screen captures - they leak whatever is on screen
-docs/
+# Screen captures leak whatever happens to be on screen, so images are blocked
+# by default and a stray screenshot in the working tree cannot be committed by
+# accident. docs/ is the one deliberate exception: the README's screenshots are
+# put there on purpose and reviewed before they are committed.
 *.png
 *.jpg
 *.jpeg
+!docs/*.png
