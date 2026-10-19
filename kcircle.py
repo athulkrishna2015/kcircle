@@ -1532,16 +1532,58 @@ def _allow_local_lens_upload(page) -> None:
 # header and the search box. Results are not restyled or re-wrapped at all;
 # they lay out as Google intends at whatever width the panel is. Widen the
 # panel if desktop results look cramped.
+# Page furniture that is never a result: site navigation and the footer.
+#
+# This deliberately does NOT touch <header> / [role="banner"] or the search
+# form. It used to, which made Google's own search box blink into view and then
+# vanish about a second later - the page painted normally, and this stylesheet
+# was injected on loadFinished (plus nudges at 900ms and 2200ms). kcircle's URL
+# bar shows the *result URL*, not a query field, so hiding Google's removed the
+# only way to refine a search without leaving the panel.
 _RESPONSIVE_CSS = """
-header, [role="banner"], #topnav, #gnav, div#header, div#hdt,
+nav, [role="navigation"], #topnav, #gnav, div#hdt,
 .navigation, #foot, #search_footer {
   display: none !important;
 }
-form[action="/search"], #search,
+"""
+
+# Opt-in only, for anyone who wants the vertical space back.
+_HIDE_SEARCH_CSS = """
+header, [role="banner"], form[action="/search"], #search,
 textarea[name="q"], input[name="q"] {
   display: none !important;
 }
 """
+
+
+def _fit_width() -> bool:
+    """Scale results to fit the panel (default), or render them at 100%.
+
+    Fit-width keeps Google's ~652px column inside a narrow panel so there is
+    no horizontal scrolling. Turning it off renders at normal size, which is
+    easier to read and scrollable. Neither setting drops any results.
+    """
+    if os.environ.get("KCIRCLE_NO_FIT_WIDTH") == "1":
+        return False
+    return bool(load_settings().get("fit_width", True))
+
+
+def _hide_google_search() -> bool:
+    """Whether to strip Google's own search box out of the results.
+
+    Off by default. The box is a genuine control, and hiding page furniture is
+    a means of saving space rather than a feature in its own right.
+    """
+    if os.environ.get("KCIRCLE_NO_SEARCH_BAR") == "1":
+        return True
+    return not load_settings().get("google_search_bar", True)
+
+
+def _responsive_css() -> str:
+    """The stylesheet for the embedded results page, honouring the setting."""
+    if _hide_google_search():
+        return _RESPONSIVE_CSS + _HIDE_SEARCH_CSS
+    return _RESPONSIVE_CSS
 
 MOBILE_UA = (
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
@@ -1594,7 +1636,7 @@ def _responsive_script() -> str:
     """
     return f"""
 (function(){{
-  var css = {_RESPONSIVE_CSS!r};
+  var css = {_responsive_css()!r};
   var s = document.getElementById('kcircle-css');
   if (s) {{
     if (s.textContent !== css) s.textContent = css;
@@ -2237,10 +2279,17 @@ class ResultsPanel(QWidget):
         and let Chromium reflow and re-wrap everything natively, exactly as a
         browser zoom does. Mobile results are already fluid, so they are left
         at 1.0.
+
+        This scales, it never crops: the whole result set stays in the DOM and
+        is reachable by scrolling. At the default panel width it renders at
+        roughly 70%, which is small to read. Widen the panel past ~660px and
+        the zoom reaches 1.0 on its own, or set fit_width to false in
+        settings.json / KCIRCLE_NO_FIT_WIDTH=1 to force full size and scroll
+        sideways instead.
         """
         if self.web is None:
             return
-        if self._ua_mode != "desktop":
+        if self._ua_mode != "desktop" or not _fit_width():
             self.web.setZoomFactor(1.0)
             return
         width = max(1, self.web.width())

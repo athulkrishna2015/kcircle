@@ -1006,9 +1006,74 @@ def test_css():
     for banned in ("word-break", "grid-template", "overflow-wrap",
                    "div:empty", "[data-ved]", "#center_col", "flex-direction"):
         check(banned not in css, f"css does not override {banned}")
-    # page furniture is still hidden so it does not eat the panel
-    check('textarea[name="q"]' in css, "search box still hidden")
-    check("header" in css, "page header still hidden")
+    # Nav and footer furniture is still hidden so it does not eat the panel.
+    for hidden in ("#topnav", "#gnav", "#foot", "#search_footer"):
+        check(hidden in css, f"{hidden} still hidden")
+    # The search box is NOT hidden by default. It used to be, which made
+    # Google's own box flash up and vanish a second after the page painted.
+    for kept in ('textarea[name="q"]', 'input[name="q"]', '[role="banner"]',
+                 "header"):
+        check(kept not in css, f"default css leaves {kept} alone")
+    check(_hide_search_off(), "google_search_bar defaults to on")
+
+
+def _hide_search_off() -> bool:
+    """_responsive_css() must not carry the search-hiding block by default."""
+    import os as _os
+    saved = _os.environ.pop("KCIRCLE_NO_SEARCH_BAR", None)
+    try:
+        css = k._responsive_css()
+    finally:
+        if saved is not None:
+            _os.environ["KCIRCLE_NO_SEARCH_BAR"] = saved
+    return 'textarea[name="q"]' not in css
+
+
+def test_search_bar_toggle():
+    print("\n== google search box toggle ==")
+    import os as _os
+    d = tempfile.mkdtemp(prefix="kcircle-sb-")
+    saved = k._settings_path
+    k._settings_path = lambda: os.path.join(d, "settings.json")
+    try:
+        _os.environ.pop("KCIRCLE_NO_SEARCH_BAR", None)
+        check(not k._hide_google_search(),
+              "the search box is kept unless asked otherwise")
+        check('textarea[name="q"]' not in k._responsive_css(),
+              "and no rule targets it by default")
+
+        _os.environ["KCIRCLE_NO_SEARCH_BAR"] = "1"
+        check(k._hide_google_search(), "env var opts into hiding it")
+        check('textarea[name="q"]' in k._responsive_css(),
+              "and the rule is then applied")
+    finally:
+        _os.environ.pop("KCIRCLE_NO_SEARCH_BAR", None)
+        k._settings_path = saved
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_fit_width_toggle():
+    print("\n== results are scaled, never cropped ==")
+    import os as _os
+    d = tempfile.mkdtemp(prefix="kcircle-fw-")
+    saved = k._settings_path
+    k._settings_path = lambda: os.path.join(d, "settings.json")
+    try:
+        _os.environ.pop("KCIRCLE_NO_FIT_WIDTH", None)
+        check(k._fit_width(), "results are fitted to the panel by default")
+        _os.environ["KCIRCLE_NO_FIT_WIDTH"] = "1"
+        check(not k._fit_width(), "and can be rendered at 100% instead")
+        # zoom is a scale factor: it never exceeds 1, so nothing is cut off
+        for w in (320, 460, 652, 700, 1200):
+            zoom = min(1.0, max(0.40, w / k.GOOGLE_DESKTOP_COLUMN))
+            check(0 < zoom <= 1.0,
+                  f"panel {w}px -> zoom {zoom:.2f}, nothing cropped")
+        check(min(1.0, 700 / k.GOOGLE_DESKTOP_COLUMN) == 1.0,
+              "a wide enough panel reaches 100% on its own")
+    finally:
+        _os.environ.pop("KCIRCLE_NO_FIT_WIDTH", None)
+        k._settings_path = saved
+        shutil.rmtree(d, ignore_errors=True)
     js = k._responsive_script()
     check("kcircle-css" in js, "css injection is idempotent (tag id)")
     check("old.remove" not in js,
@@ -1033,6 +1098,8 @@ def main():
     test_switch_modifier_mid_drag()
     test_minimize_keeps_the_panel()
     test_launching_always_captures()
+    test_search_bar_toggle()
+    test_fit_width_toggle()
     test_tray_icon_fallback()
     test_overlay_covers_the_screen()
     test_tap_selects_object()

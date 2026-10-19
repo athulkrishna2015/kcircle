@@ -22,7 +22,9 @@ results land in a compact always-on-top panel.
 - **Animated glow** while you draw: a soft halo, a bright core, a comet tail
   and a spark that rides the cursor.
 - **Real Google Lens results** — AI Overview, Exact matches, Visual matches —
-  rendered in an embedded view, not a browser window.
+  rendered in an embedded view, not a browser window, with Google's own
+  search box left in place so you can refine a query without leaving the
+  panel.
 - **Text in any language.** Scribble over a run of text and it is read by
   Google's own OCR server-side, so every script and font works and your CPU
   does nothing. The result is selectable and copyable.
@@ -196,6 +198,27 @@ the drawn area and everything outside the stroke stays **transparent** — set
 `KCIRCLE_CROP_BG=white` if you need a solid background instead. Shapes without
 a mask (`rect`, `corner`, `ellipse`) send their bounding box as plain RGB.
 
+## Results are scaled, never cropped
+
+Google lays desktop results out in a fixed ~652px column. kcircle zooms the
+page so that column fits the panel, and lets Chromium re-wrap it natively —
+the same thing a browser zoom does, rather than fighting the layout with CSS.
+
+That is a **scale, not a crop**. The entire result set stays in the page and
+is reachable by scrolling; nothing is cut off. At the default panel width it
+simply renders smaller:
+
+| Panel width | Zoom |
+| --- | --- |
+| 320px | 0.49 |
+| 460px (default) | 0.71 |
+| 660px and up | 1.00 |
+
+So if the text is too small to read, widen the panel past ~660px and the zoom
+reaches 1.00 on its own — no setting needed. Or force full size and scroll
+sideways with `KCIRCLE_NO_FIT_WIDTH=1`, or `"fit_width": false` in
+`settings.json`.
+
 ## Why two tabs
 
 Google serves a different layout per user agent, and the useful ones trade off:
@@ -321,6 +344,8 @@ Environment:
 | `KCIRCLE_REPROBE` | `1` to re-run the QtWebEngine health check |
 | `KCIRCLE_NO_BYPASS_WM` | `1` to drop `BypassWindowManagerHint` from the capture overlay |
 | `KCIRCLE_NO_SNAP` | `1` to disable the tap and scribble-to-search detection |
+| `KCIRCLE_NO_SEARCH_BAR` | `1` to hide Google's own search box in the results |
+| `KCIRCLE_NO_FIT_WIDTH` | `1` to render results at 100% instead of fitting them to the panel |
 
 Debug logging records the selection region, the crop size, how much of the
 upload the mask covers, and which file is sent to Google — enough to diagnose
