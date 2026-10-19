@@ -13,6 +13,11 @@ dependencies = [
 [project.scripts]
 kcircle = "kcircle:main"
 
+# Optional extras. None of these are needed for circling, tapping or text
+# search - they only add a decoder on top of what already works.
+[project.optional-dependencies]
+qr = ["zxing-cpp>=2.2"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -23,7 +23,18 @@ results land in a compact always-on-top panel.
   and a spark that rides the cursor.
 - **Real Google Lens results** — AI Overview, Exact matches, Visual matches —
   rendered in an embedded view, not a browser window.
-- **Instant OCR** on the Text tab, no browser engine involved.
+- **Text in any language.** Scribble over a run of text and it is read by
+  Google's own OCR server-side, so every script and font works and your CPU
+  does nothing. The result is selectable and copyable.
+- **QR codes and barcodes** are decoded locally and shown above the OCR text.
+  Install the optional decoder with `uv pip install zxing-cpp` (or the `qr`
+  extra); without it QR images are still searched as pictures.
+- **Tap to search.** The screen is scanned while the overlay opens and the
+  objects on it are outlined. A single click selects whatever is under the
+  cursor — the same gesture as Circle to Search, where you tap the boots and
+  scribble the bag.
+- **Scribble to search.** Draw a loose loop around one thing and it snaps to
+  that thing. A big deliberate lasso is always honoured exactly as drawn.
 - **Four selection shapes** — `corner`, `rect`, `lasso`, `ellipse` — with the
   choice remembered between runs. Hold Shift in `corner` mode for a square.
 - **Three capture scopes** — draw a region, grab the active window, or take
@@ -34,6 +45,37 @@ results land in a compact always-on-top panel.
   remembered between runs.
 - **Last tab** — Text or Visual matches, reopened on the next launch.
 - **Resizable and movable**, with position and size remembered.
+
+## Tap and scribble
+
+Circle to Search on Android never waits for you to circle something: it
+segments the screen the instant it freezes, then just checks your touch
+against that pre-computed grid. kcircle does the same thing, locally.
+
+While the overlay is opening, a background thread reduces the frozen frame to
+a small binary edge map and runs recursive projection (XY-cut) layout analysis
+on it — the same classic technique used to segment scanned documents. It cuts
+the screen on empty gutters until the regions stop dividing, then keeps the
+leaves that look like real things on it. Every pixel-level step runs inside
+Pillow's C code; Python only walks a few hundred projection entries, so the
+whole pass is a few tens of milliseconds on a 1080p capture.
+
+Deliberately, it is a heuristic and not a neural network:
+
+- No model, no download, no GPU, and **no new dependencies** — it uses the
+  Pillow that was already there.
+- When nothing is found (a gradient, a video, a dense wall of text) it says
+  so quietly. A click then falls back to a small box around the cursor, which
+  is a perfectly good search — you are never blocked.
+- Snapping is deliberately conservative: it only fires when the stroke is
+  small, exactly one object is inside it, and that object is clearly smaller
+  than the stroke. Otherwise your lasso is used verbatim.
+
+Turn it off with `KCIRCLE_NO_SNAP=1`, or from the `◎ tap` button in the panel.
+
+Text is never OCR'd here. Draw over text and the crop goes to Google's own
+endpoint via `chrome-lens-py`, exactly like the rest of the app, so all
+languages and fonts are handled by the service that owns them.
 
 ## Capture scopes
 

@@ -304,7 +304,191 @@ def test_overlay_hint(scene):
           "hint does not intercept the selection click")
 
 
+# ----------------------------------------------------------------- tap / snap
+
+def settle(ov):
+    """Wait for the background object scan and deliver its queued signal.
+
+    ObjectWorker emits from its own thread, so the result arrives as a queued
+    connection that only lands when the main thread pumps events. This harness
+    has no running event loop, so deliver it explicitly.
+    """
+    scanner = getattr(ov, "_scanner", None)
+    if scanner is not None:
+        scanner.wait(5000)
+        QApplication.processEvents()
+
+
+def object_scene():
+    """A screenshot with three clean, well-separated objects on a flat page."""
+    im = Image.new("RGB", SCREEN, (244, 245, 247))
+    d = ImageDraw.Draw(im)
+    # left card, right card, bottom card - separated by wide gutters
+    d.rectangle([80, 120, 700, 500], fill=(255, 255, 255),
+                outline=(180, 184, 192), width=3)
+    d.rectangle([900, 120, 1520, 500], fill=(255, 255, 255),
+                outline=(180, 184, 192), width=3)
+    d.rectangle([80, 600, 700, 800], fill=(255, 255, 255),
+                outline=(180, 184, 192), width=3)
+    path = os.path.join(tempfile.gettempdir(), "_objects.png")
+    im.save(path)
+    return path
+
+
+def tap(ov, pos):
+    """A press and release at the same point: a click, not a drag."""
+    got = {}
+    ov.picked.connect(lambda s: got.__setitem__("s", s))
+    ov.mousePressEvent(ev(PRESS, pos, NONE))
+    ov.mouseReleaseEvent(ev(RELEASE, pos, NONE))
+    return got.get("s")
+
+
+def test_object_detection():
+    print("\n== local object detection ==")
+    boxes = k.detect_objects(object_scene())
+    check(len(boxes) > 0, f"found objects on a structured screen ({len(boxes)})")
+    check(len(k.detect_objects(
+        _blank_scene())) == 0, "a blank screen proposes nothing")
+    # each card's centre should be covered by some proposal
+    for name, (cx, cy) in (("left card", (390, 310)),
+                           ("right card", (1210, 310)),
+                           ("bottom card", (390, 700))):
+        nx, ny = cx / SCREEN[0], cy / SCREEN[1]
+        check(any(b.contains(nx, ny) for b in boxes), f"{name} is tappable")
+
+
+def _blank_scene():
+    path = os.path.join(tempfile.gettempdir(), "_blank.png")
+    Image.new("RGB", SCREEN, (10, 10, 12)).save(path)
+    return path
+
+
+def test_tap_selects_object():
+    print("\n== tap to search ==")
+    ov = new_overlay(object_scene(), "rect")
+    settle(ov)
+    check(len(ov.objects) > 0, "overlay received object proposals")
+
+    sel = tap(ov, (390, 310))                 # centre of the left card
+    check(sel is not None, "a click produced a selection")
+    if sel:
+        rect, poly = sel
+        check(poly is None, "tap yields a clean rectangle, not a lasso mask")
+        check(rect[0] < 390 / SCREEN[0] < rect[2]
+              and rect[1] < 310 / SCREEN[1] < rect[3],
+              "the tapped point is inside the returned region")
+        check((rect[2] - rect[0]) * (rect[3] - rect[1]) < 0.60,
+              "the tap did not select the whole screen")
+
+
+def test_tap_without_object_falls_back():
+    print("\n== tap on nothing detected ==")
+    ov = new_overlay(_blank_scene(), "rect")
+    settle(ov)
+    check(len(ov.objects) == 0, "no objects were proposed")
+    sel = tap(ov, (800, 450))
+    check(sel is not None, "a click still selects something")
+    if sel:
+        rect, _ = sel
+        cx, cy = rect[0] + (rect[2] - rect[0]) / 2, rect[1] + (rect[3] - rect[1]) / 2
+        check(abs(cx - 800 / SCREEN[0]) < 0.06 and abs(cy - 450 / SCREEN[1]) < 0.06,
+              "the fallback box is centred on the click")
+        check((rect[2] - rect[0]) < 0.3, "the fallback box is small")
+
+
+def test_drag_is_not_a_tap():
+    print("\n== a drag is still a drag ==")
+    ov = new_overlay(object_scene(), "rect")
+    settle(ov)
+    got = {}
+    ov.picked.connect(lambda s: got.__setitem__("s", s))
+    ov.mousePressEvent(ev(PRESS, (200, 150), NONE))
+    ov.mouseMoveEvent(ev(MOVE, (400, 350), NONE))
+    ov.mouseReleaseEvent(ev(RELEASE, (400, 350), NONE))
+    sel = got.get("s")
+    check(sel is not None, "the drag produced a selection")
+    if sel:
+        rect, _ = sel
+        # a drag reports the drag rectangle, not a detected object
+        check(abs((rect[2] - rect[0]) - 200 / SCREEN[0]) < 0.02,
+              "the drag rectangle is reported verbatim")
+
+
+def test_scribble_snaps():
+    print("\n== scribble to search ==")
+    ov = new_overlay(object_scene(), "lasso")
+    settle(ov)
+    ov.snap = True
+    check(len(ov.objects) > 0, "overlay received object proposals")
+
+    # a loose loop drawn well outside the left card should snap onto it
+    got = {}
+    ov.picked.connect(lambda s: got.__setitem__("s", s))
+    loop = circle(390, 310, 360, 280)   # deliberately looser than the card
+    ov.mousePressEvent(ev(PRESS, loop[0], NONE))
+    for pt in loop[1:]:
+        ov.mouseMoveEvent(ev(MOVE, pt, NONE))
+    ov.mouseReleaseEvent(ev(RELEASE, loop[-1], NONE))
+    sel = got.get("s")
+    check(sel is not None, "the scribble produced a selection")
+    if sel:
+        rect, poly = sel
+        check(poly is None, "a snapped scribble selects a clean rectangle")
+        check(rect[0] < 390 / SCREEN[0] < rect[2],
+              "the snapped region contains the scribbled object")
+
+
+def test_big_lasso_is_not_hijacked():
+    print("\n== a deliberate lasso is left alone ==")
+    ov = new_overlay(object_scene(), "lasso")
+    settle(ov)
+    ov.snap = True
+    got = {}
+    ov.picked.connect(lambda s: got.__setitem__("s", s))
+    loop = circle(800, 450, 740, 400)           # encloses everything
+    ov.mousePressEvent(ev(PRESS, loop[0], NONE))
+    for pt in loop[1:]:
+        ov.mouseMoveEvent(ev(MOVE, pt, NONE))
+    ov.mouseReleaseEvent(ev(RELEASE, loop[-1], NONE))
+    sel = got.get("s")
+    check(sel is not None, "the lasso produced a selection")
+    if sel:
+        rect, poly = sel
+        check(poly is not None,
+              "a large lasso keeps its own polygon instead of snapping")
+        check((rect[2] - rect[0]) * (rect[3] - rect[1]) > 0.5,
+              "the returned region is the large one that was drawn")
+
+
 # ----------------------------------------------------------------- UA
+
+def test_barcode_support():
+    print("\n== qr / barcode ==")
+    # The decoder is optional: with nothing installed this must be a quiet
+    # no-op rather than an error, because circling must never depend on it.
+    import types
+
+    try:
+        import zxingcpp  # noqa: F401
+        available = True
+    except Exception:                                   # noqa: BLE001
+        available = False
+
+    saved = sys.modules.get("zxingcpp")
+    try:
+        # importable but missing the API: must not raise
+        sys.modules["zxingcpp"] = types.ModuleType("zxingcpp")
+        check(k.decode_barcodes("/nonexistent.png") == [],
+              "an unusable decoder yields no barcodes instead of raising")
+    finally:
+        if saved is not None:
+            sys.modules["zxingcpp"] = saved
+        else:
+            sys.modules.pop("zxingcpp", None)
+    check(True,
+          f"zxing-cpp {'present' if available else 'absent'} (both supported)")
+
 
 def test_ua():
     print("\n== user agents ==")
@@ -583,6 +767,13 @@ def main():
     test_square(scene)
     test_modifier_overrides(scene)
     test_overlay_hint(scene)
+    test_object_detection()
+    test_tap_selects_object()
+    test_tap_without_object_falls_back()
+    test_drag_is_not_a_tap()
+    test_scribble_snaps()
+    test_big_lasso_is_not_hijacked()
+    test_barcode_support()
     test_ua()
     test_upload_gate()
     test_upload_page()

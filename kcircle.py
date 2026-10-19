@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
@@ -314,6 +315,454 @@ def capture(scope: str = "select") -> str:
     raise RuntimeError(f"capture failed for scope={scope}: {last}")
 
 
+# ------------------------------------------------------------ object detection
+
+# Object boxes are proposed locally, before the user moves the mouse, so that a
+# single click lands on a thing instead of needing a careful drag. This is the
+# desktop stand-in for the on-device pre-segmentation Circle to Search does
+# while the screen is still freezing.
+#
+# Everything here is a heuristic on the frozen PNG. It has no model and no
+# network: it finds visually coherent rectangles (cards, images, buttons, text
+# blocks, icons) and hands them to the overlay as tap targets. When it finds
+# nothing useful the overlay silently falls back to drag-only selection, so a
+# bad guess can never block a selection the user is drawing by hand.
+
+# Work at a fraction of the capture: detection only needs to place a box around
+# a subject, and a 1080p pass costs far more time for no extra accuracy.
+OBJ_WORK_W = 480
+
+# An "object" has to be big enough to be worth searching and small enough not to
+# be the whole desktop. Both bounds are fractions of the screen area.
+OBJ_MIN_AREA = 0.0015          # 0.15% - a small icon
+OBJ_MAX_AREA = 0.45            # 45% - a photo, but not the page
+
+# Ignore regions thinner than this many pixels at work scale. UI hairlines and
+# 1px dividers produce a huge number of degenerate boxes otherwise.
+OBJ_MIN_SIDE = 14
+
+# Edge threshold on the 0..255 FIND_EDGES output. Low enough to catch a glyph
+# or a hairline border, high enough to ignore compression noise in flat areas.
+OBJ_EDGE_T = 22
+
+# Dilation radius in work pixels. Two is enough to weld the gaps between the
+# strokes of a word or an icon into one blob.
+OBJ_DILATE = 2
+
+# A row or column counts as a gutter when its ink count is at or below this
+# fraction of the region's own peak, with an absolute floor underneath.
+#
+# It has to be relative. One full-height divider or one full-width toolbar puts
+# a little ink into every row or column of the other axis, so an absolute
+# "empty" threshold never fires on a real desktop and nothing splits at all.
+# Measuring against the peak calls a line quiet relative to the busiest line in
+# this region, which is what a margin actually looks like.
+OBJ_QUIET_RATIO = 0.03
+OBJ_QUIET_FLOOR = 1
+
+# A gutter also has to be reasonably wide, as a fraction of the region being
+# cut. Without this, the small gaps between the lines of a paragraph read as row
+# gutters and a block of text gets sliced into one target per line.
+OBJ_MIN_GAP_RATIO = 0.025
+
+
+# Recursion cap for the gutter split. Deep enough to separate a page into
+# sidebar / body / cards, shallow enough to stay a few hundred operations.
+OBJ_MAX_DEPTH = 7
+
+# Hard cap on proposed regions. A pathological screen (dense collage, a
+# terminal full of text) can otherwise split until the depth limit, and the
+# caller only ever shows a handful of targets anyway.
+OBJ_MAX_REGIONS = 64
+
+
+# A leaf region has to actually contain edges. Very sparse leaves are just the
+# background between elements that survived a cut.
+OBJ_MIN_INK = 0.02
+
+# Pad the detected box outward slightly. Object detectors report the visible
+# extent; a search crop that clips the subject's shadow or outline reads worse
+# than one that includes a little background.
+OBJ_PAD = 0.004
+
+# A click counts as a tap (rather than the start of a drag) below this many
+# pixels of travel. Qt reports integer widget coords, so a few px of jitter is
+# normal on a trackpad.
+TAP_SLOP = 8
+TAP_MS = 450
+
+# Scribble snapping. The object has to be at least this fraction inside what was
+# drawn, and the drawn region has to be at least this much larger than the
+# object. Both guards exist so that snapping never hijacks a deliberate lasso.
+OBJ_SNAP_COVERAGE = 0.55
+OBJ_SNAP_MAX_FILL = 0.92
+# A stroke covering more of the screen than this is a deliberate
+# selection, never a rough circle around one object.
+OBJ_SNAP_MAX_DRAWN = 0.30
+
+# A region this wide-and-flat, and no denser than this, reads as a run of text
+# rather than a picture.
+OBJ_TEXT_MIN_ASPECT = 2.2
+OBJ_TEXT_MAX_INK = 0.75
+
+
+class ObjectBox:
+    """One proposed object, in normalised 0..1 screen coordinates."""
+
+    __slots__ = ("rect", "score", "kind")
+
+    def __init__(self, rect, score, kind):
+        self.rect = rect                    # (x1, y1, x2, y2) normalised
+        self.score = score                  # 0..1, higher is more confident
+        self.kind = kind                    # "region" or "text"
+
+    def contains(self, nx, ny, slack=0.0):
+        x1, y1, x2, y2 = self.rect
+        return (x1 - slack <= nx <= x2 + slack
+                and y1 - slack <= ny <= y2 + slack)
+
+    def area(self):
+        x1, y1, x2, y2 = self.rect
+        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+    def iou(self, other):
+        ax1, ay1, ax2, ay2 = self.rect
+        bx1, by1, bx2, by2 = other
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        union = self.area() + max(0.0, bx2 - bx1) * max(0.0, by2 - by1) - inter
+        return inter / union if union > 0 else 0.0
+
+    def __repr__(self):
+        return f"ObjectBox({self.kind}, {self.rect}, {self.score:.2f})"
+
+
+def _ink_map(shot_path):
+    """Reduce a screenshot to a small 1-bit "ink" map of visual edges.
+
+    Everything expensive runs inside Pillow's C code; Python never touches an
+    individual pixel. Three choices carry the speed:
+
+      * convert straight to "L" - we only need luma, never colour;
+      * `reduce()` rather than a general resample - integer box averaging is
+        several times cheaper than resizing 2076px down to 480px;
+      * dilate with ImageChops.offset+lighter instead of MaxFilter. On a binary
+        mask that is the same morphology at roughly a fortieth the cost
+        (7ms -> 0.2ms per pass here).
+    """
+    from PIL import Image, ImageChops, ImageFilter
+
+    with Image.open(shot_path) as im:
+        gray = im.convert("L")
+        full_w, full_h = gray.size
+
+    factor = max(1, full_w // OBJ_WORK_W)
+    if factor > 1:
+        gray = gray.reduce(factor)
+    if gray.size[0] > OBJ_WORK_W * 3 // 2:    # reduce() may overshoot
+        gray = gray.resize((OBJ_WORK_W,
+                            max(1, round(gray.size[1] * OBJ_WORK_W
+                                         / float(gray.size[0])))),
+                           Image.Resampling.BOX)
+
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = edges.point(lambda v: 255 if v > OBJ_EDGE_T else 0, mode="L")
+
+    # FIND_EDGES convolves against an assumed black border, so the outermost
+    # rows and columns light up along their entire length. That one artifact
+    # would put ink in every row and every column, defeating both the gutter
+    # search and the tight-bbox pass. Clear it before dilating, or the
+    # dilation smears it straight back inwards.
+    w, h = edges.size
+    for box in ((0, 0, w, 1), (0, h - 1, w, h),
+                (0, 0, 1, h), (w - 1, 0, w, h)):
+        edges.paste(0, box)
+
+    for _ in range(OBJ_DILATE):
+        edges = ImageChops.lighter(edges, ImageChops.offset(edges, 1, 0))
+        edges = ImageChops.lighter(edges, ImageChops.offset(edges, -1, 0))
+        edges = ImageChops.lighter(edges, ImageChops.offset(edges, 0, 1))
+        edges = ImageChops.lighter(edges, ImageChops.offset(edges, 0, -1))
+
+    # offset() wraps around, which would smear the screen's own edge pixels onto
+    # the opposite border and hide a genuine gutter there.
+    w, h = edges.size
+    for box in ((0, 0, w, OBJ_DILATE), (0, h - OBJ_DILATE, w, h),
+                (0, 0, OBJ_DILATE, h), (w - OBJ_DILATE, 0, w, h)):
+        edges.paste(0, box)
+
+    return edges, full_w, full_h
+
+
+def _projection(mask, axis):
+    """Count of ink pixels per column (axis=0) or per row (axis=1).
+
+    Uses Pillow's BOX resample to collapse one axis, so the whole projection is
+    a single C-level operation rather than a Python loop over pixels. The BOX
+    resample yields a 0..255 average per remaining line, so scaling back by the
+    collapsed axis length turns it into an integer ink-pixel count.
+    """
+    from PIL import Image
+
+    w, h = mask.size
+    if axis == 0:                                     # per column
+        raw = mask.resize((w, 1), Image.Resampling.BOX).tobytes()
+        return [raw[i] * h // 255 for i in range(len(raw))]
+    raw = mask.resize((1, h), Image.Resampling.BOX).tobytes()   # per row
+    return [raw[i] * w // 255 for i in range(len(raw))]
+
+
+def _split_region(prof, lo, hi, min_side):
+    """The widest quiet band inside prof[lo:hi], as (start, end), or None.
+
+    A "quiet" run is a stretch of rows/columns carrying almost no ink - a
+    gutter between two cards, or the margin beside a paragraph. Splitting on
+    gutters is the classic recursive projection layout analysis, and it finds
+    the rectangular structure of a screen without Python ever looking at a
+    single pixel.
+    """
+    peak = max(prof[lo:hi]) if hi > lo else 0
+    quiet = max(OBJ_QUIET_FLOOR, int(peak * OBJ_QUIET_RATIO))
+    min_run = max(3, int((hi - lo) * OBJ_MIN_GAP_RATIO))
+    best = None
+    i = lo
+    while i < hi:
+        if prof[i] > quiet:
+            i += 1
+            continue
+        j = i
+        while j < hi and prof[j] <= quiet:
+            j += 1
+        if (j - i) >= min_run and (i - lo) >= min_side and (hi - j) >= min_side:
+            if best is None or (j - i) > (best[1] - best[0]):
+                best = (i, j)
+        i = j
+    return best
+
+
+def _xy_cut(mask, x0, y0, x1, y1, depth, out):
+    """Recursively split on the widest ink-free gutter until regions stop.
+
+    Projections are recomputed per region rather than reused from the whole
+    screen: a column that is busy elsewhere is still a perfectly good gutter
+    inside the block currently being cut.
+
+    The axis matters. A screenshot almost always has full-width chrome (a
+    toolbar, a dock), which makes every single column "busy" and no vertical
+    gutter findable until that chrome has been cut away. So both axes are
+    measured and the wider gutter wins, exactly as in classical XY-cut -
+    cutting columns first unconditionally would never split a normal desktop.
+    """
+    w_region, h_region = x1 - x0, y1 - y0
+    if (depth >= OBJ_MAX_DEPTH or len(out) >= OBJ_MAX_REGIONS
+            or w_region < OBJ_MIN_SIDE * 2 or h_region < OBJ_MIN_SIDE * 2):
+        out.append((x0, y0, x1, y1))
+        return
+
+    sub = mask.crop((x0, y0, x1, y1))
+    vrun = _split_region(_projection(sub, 0), 0, w_region, OBJ_MIN_SIDE)
+    hrun = _split_region(_projection(sub, 1), 0, h_region, OBJ_MIN_SIDE)
+
+    vw = 0 if vrun is None else vrun[1] - vrun[0]
+    hw = 0 if hrun is None else hrun[1] - hrun[0]
+    if vw == 0 and hw == 0:
+        out.append((x0, y0, x1, y1))
+        return
+
+    if vw >= hw:
+        cut = (vrun[0] + vrun[1]) // 2
+        _xy_cut(mask, x0, y0, x0 + cut, y1, depth + 1, out)
+        _xy_cut(mask, x0 + cut, y0, x1, y1, depth + 1, out)
+    else:
+        cut = (hrun[0] + hrun[1]) // 2
+        _xy_cut(mask, x0, y0, x1, y0 + cut, depth + 1, out)
+        _xy_cut(mask, x0, y0 + cut, x1, y1, depth + 1, out)
+
+
+def _classify(bw, bh, ink):
+    """Label a region "text" or "object", for display and snap preference.
+
+    Text runs are wide, short and only moderately filled: the gaps between
+    glyphs keep the ink density well below a solid photo or button. This is a
+    shape heuristic only - the actual reading of the words is Google's job,
+    done server-side by chrome-lens-py, so nothing here has to recognise a
+    language, a font or a script.
+    """
+    wide = bw / float(max(1, bh))
+    if wide >= OBJ_TEXT_MIN_ASPECT and ink < OBJ_TEXT_MAX_INK:
+        return "text"
+    return "object"
+
+
+def _tighten(mask, box):
+    """Shrink a region to the bounding box of its own ink.
+
+    The gutter split cuts on empty space, so a leaf routinely carries a wide
+    margin: a card sitting in the middle of a column is proposed as "the whole
+    column". Measuring against the drawn area rather than the cut area is both
+    more accurate and stops a generous margin from pushing a perfectly good
+    object past the size limit.
+
+    One getbbox() call does the whole job in C.
+    """
+    x0, y0, x1, y1 = box
+    inner = mask.crop(box).getbbox()
+    if not inner:
+        return box
+    return (x0 + inner[0], y0 + inner[1], x0 + inner[2], y0 + inner[3])
+
+
+def _ink_fraction(mask, box):
+    """How much of box is ink, 0..1, via a histogram rather than a pixel loop."""
+    x0, y0, x1, y1 = box
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    crop = mask.crop(box)
+    hist = crop.histogram()
+    ink = sum(hist[128:])
+    return ink / float((x1 - x0) * (y1 - y0))
+
+
+def _merge_overlapping(boxes, iou_limit=0.45):
+    """Collapse near-duplicate proposals, keeping the larger/higher-scoring."""
+    kept = []
+    for box in boxes:
+        rect, score, kind = box.rect, box.score, box.kind
+        merged = False
+        for other in kept:
+            if ObjectBox(rect, 0, kind).iou(other.rect) >= iou_limit:
+                # keep whichever covers more area; ties go to the better score
+                if rect_area(rect) > rect_area(other.rect) or (
+                        rect_area(rect) == rect_area(other.rect)
+                        and score > other.score):
+                    kept[kept.index(other)] = box
+                merged = True
+                break
+        if not merged:
+            kept.append(box)
+    return kept
+
+
+def rect_area(rect):
+    return max(0.0, rect[2] - rect[0]) * max(0.0, rect[3] - rect[1])
+
+
+def detect_objects(shot_path):
+    """Propose tap targets for a frozen screenshot.
+
+    Recursive projection (XY-cut) layout analysis on a heavily reduced edge map:
+    split the screen on ink-free gutters until the regions stop dividing, then
+    keep the leaves that look like real things on screen.
+
+    The cost is bounded and small. The image is resized to 480px wide and every
+    pixel-level operation runs inside Pillow's C code; Python only walks a few
+    hundred projection entries. On a 1080p capture this is a handful of
+    milliseconds, which is what lets it run while the overlay is still opening.
+
+    Returns a list of ObjectBox, best first. An empty list means "nothing
+    confident found", and the caller must fall back to manual selection rather
+    than pretend a tap meant something.
+    """
+    try:
+        mask, W, H = _ink_map(shot_path)
+    except Exception as exc:                          # noqa: BLE001
+        if logg:
+            logg.debug("object detection could not read %s: %s", shot_path, exc)
+        return []
+
+    w, h = mask.size
+    if w < 8 or h < 8:
+        return []
+    if max(_projection(mask, 0)) <= 0:
+        return []                                     # blank screen
+
+    regions = []
+    _xy_cut(mask, 0, 0, w, h, 0, regions)
+
+    proposals = []
+    for (x0, y0, x1, y1) in regions:
+        bw, bh = x1 - x0, y1 - y0
+        if bw < OBJ_MIN_SIDE or bh < OBJ_MIN_SIDE:
+            continue
+
+        # Judge the object, not the gutter cell it arrived in.
+        x0, y0, x1, y1 = _tighten(mask, (x0, y0, x1, y1))
+        bw, bh = x1 - x0, y1 - y0
+        if bw < OBJ_MIN_SIDE or bh < OBJ_MIN_SIDE:
+            continue
+        area = (bw * bh) / float(w * h)
+        if area < OBJ_MIN_AREA or area > OBJ_MAX_AREA:
+            continue
+
+        ink = _ink_fraction(mask, (x0, y0, x1, y1))
+        if ink < OBJ_MIN_INK:
+            continue
+        score = min(1.0, ink * 0.85 + 0.15)
+        proposals.append(
+            ObjectBox(_normalise(x0, y0, x1, y1, w, h), score, _classify(bw, bh, ink)))
+
+    if not proposals:
+        # Nothing structural. That is a legitimate answer - a gradient, a video
+        # or a dense page of text has no clean object bounds - and the overlay
+        # falls back to a small box around the tap point rather than guessing.
+        return []
+
+    proposals = _merge_overlapping(proposals)
+    # Smaller, better-filled boxes are what a user most likely means to tap.
+    proposals.sort(key=lambda b: (-b.score, rect_area(b.rect)))
+    if logg:
+        logg.debug("object detection: %d proposals from %dx%d in %d regions",
+                   len(proposals), W, H, len(regions))
+        for b in proposals[:6]:
+            logg.debug("  %r", b)
+    return proposals
+
+
+def _normalise(x0, y0, x1, y1, w, h):
+    """Work-pixel box -> padded normalised screen rect."""
+    x1n, y1n = x0 / float(w), y0 / float(h)
+    x2n, y2n = x1 / float(w), y1 / float(h)
+    return (max(0.0, x1n - OBJ_PAD), max(0.0, y1n - OBJ_PAD),
+            min(1.0, x2n + OBJ_PAD), min(1.0, y2n + OBJ_PAD))
+
+
+class ObjectWorker(QThread):
+    """Runs detect_objects off the GUI thread.
+
+    The pass costs a few tens of milliseconds, most of it decoding the PNG.
+    Doing that inline would delay the overlay's first paint and make the whole
+    trigger feel laggy, which is exactly the latency this feature exists to
+    remove. Running it here means the overlay appears immediately and the tap
+    targets arrive a frame or two later - the same trick Circle to Search uses
+    while the screen is still freezing.
+    """
+
+    found = pyqtSignal(list)
+
+    def __init__(self, shot_path):
+        super().__init__()
+        self.shot_path = shot_path
+
+    def run(self):
+        boxes = []
+        try:
+            boxes = detect_objects(self.shot_path)
+        except Exception:                            # noqa: BLE001
+            if logg:
+                logg.debug("object detection failed", exc_info=True)
+        self.found.emit(boxes)
+
+
+# Threads are deliberately not parented to the overlay. A QThread owned by a
+# widget dies with it, and destroying a running QThread aborts the process; the
+# overlay can close long before a scan finishes. Holding them here keeps the
+# Python wrapper alive until the scan is genuinely done.
+_SCANNERS = set()
+
+
 # ----------------------------------------------------------------- selection
 
 class SelectionOverlay(QWidget):
@@ -321,6 +770,7 @@ class SelectionOverlay(QWidget):
 
     picked = pyqtSignal(tuple)   # (x1, y1, x2, y2) normalised 0..1
     cancelled = pyqtSignal()
+    missed = pyqtSignal()         # a tap that matched no object
 
     def __init__(self, shot_path: str):
         super().__init__()
@@ -346,9 +796,26 @@ class SelectionOverlay(QWidget):
         self.origin = None
         self.current = None
         self.path = []            # lasso points, in widget coords
-        self.mode = load_settings().get("mode", "rect")
+        settings = load_settings()
+        self.mode = settings.get("mode", "rect")
         self._tmp_mode = None
         self._square = False
+
+        # Tap targets and scribble snapping. Both are heuristics over the
+        # frozen screenshot, and both are strictly an accelerator: every one of
+        # them degrades to plain drag selection, and none of them can block a
+        # selection the user is making by hand.
+        self.objects = []
+        self.snap = bool(settings.get("snap", True))
+        self._press_t = None
+        self._show_objects = bool(settings.get("hint", True))
+        if os.environ.get("KCIRCLE_NO_SNAP") != "1":
+            self._scanner = ObjectWorker(shot_path)
+            _SCANNERS.add(self._scanner)
+            self._scanner.finished.connect(
+                lambda w=self._scanner: _SCANNERS.discard(w))
+            self._scanner.found.connect(self._on_objects)
+            self._scanner.start()
 
         # Cover the whole capture, not just the primary output. spectacle grabs the
         # entire virtual desktop, so an overlay sized to a single screen would
@@ -366,8 +833,8 @@ class SelectionOverlay(QWidget):
         # Parented to the overlay: a parentless QLabel is a top-level window and
         # would never be shown, so the hint silently never appeared before.
         hint = QLabel(
-            f"{mode_label}  ·  Shift = square / lasso  ·  Alt = ellipse"
-            "  ·  Esc to cancel",
+            f"{mode_label}  ·  click an object  ·  Shift = square / lasso"
+            "  ·  Alt = ellipse  ·  Esc to cancel",
             self,
         )
         hint.setStyleSheet("color:#ffffff; background:#000000aa; padding:6px 12px;")
@@ -386,6 +853,72 @@ class SelectionOverlay(QWidget):
     def _glow_tick(self):
         self.glow.t = (self.glow.t + 0.022) % 1.0
         self.update()
+
+    # tap targets -------------------------------------------------------
+    def _on_objects(self, boxes):
+        self.objects = boxes
+        self.update()
+
+    def object_at(self, nx, ny):
+        """The most specific detected object containing a normalised point.
+
+        Preferring the smallest match matters: a tap inside an icon that sits
+        in a card should select the icon, not the whole card.
+        """
+        best, best_area = None, None
+        for box in self.objects:
+            if not box.contains(nx, ny):
+                continue
+            area = box.area()
+            if best_area is None or area < best_area:
+                best, best_area = box, area
+        return best
+
+    def _tap_size(self):
+        """Side of the box used when a tap lands on no detected object."""
+        return max(48, int(min(self.width(), self.height()) * 0.08))
+
+    def _tap_rect(self, nx, ny):
+        half = self._tap_size() / float(max(1, min(self.width(),
+                                                    self.height())))
+        return (max(0.0, nx - half), max(0.0, ny - half),
+                min(1.0, nx + half), min(1.0, ny + half))
+
+    def object_for_stroke(self, rect):
+        """Best object to snap a loose scribble onto.
+
+        Scribble-to-search means "I drew roughly around one thing". Three
+        conditions, all required:
+
+          * the stroke covers less than a third of the screen - a loop that
+            big is a deliberate selection, not a rough circle;
+          * exactly one object is mostly inside it - two candidates means the
+            user drew around a group and wants the group;
+          * that object is clearly smaller than the stroke, so the scribble
+            was slack rather than a tracing of the object's own edges.
+
+        If any of them fails the lasso is honoured exactly as drawn.
+        """
+        rx1, ry1, rx2, ry2 = rect
+        drawn = max(1e-6, (rx2 - rx1) * (ry2 - ry1))
+        if drawn > OBJ_SNAP_MAX_DRAWN:
+            return None
+        hits = []
+        for box in self.objects:
+            ix1, iy1 = max(box.rect[0], rx1), max(box.rect[1], ry1)
+            ix2, iy2 = min(box.rect[2], rx2), min(box.rect[3], ry2)
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+            inter = (ix2 - ix1) * (iy2 - iy1)
+            coverage = inter / max(1e-6, box.area())
+            if coverage >= OBJ_SNAP_COVERAGE:
+                hits.append(box)
+        if len(hits) != 1:
+            return None                        # nothing, or an ambiguous group
+        box = hits[0]
+        if box.area() > OBJ_SNAP_MAX_FILL * drawn:
+            return None                        # the stroke was the point
+        return box
 
     def resizeEvent(self, e):
         hint = getattr(self, "_hint", None)
@@ -426,6 +959,20 @@ class SelectionOverlay(QWidget):
         p.fillRect(self.rect(), QColor(0, 0, 0, 110))
 
         shape = self._shape()
+
+        if self._show_objects and self.objects and shape is None:
+            # Faint outlines while nothing is being drawn: the visual cue that
+            # a click will land on something, which is what makes tapping feel
+            # deliberate rather than random.
+            pen = QPen(QColor(255, 255, 255, 46))
+            pen.setWidth(1)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for box in self.objects:
+                r = QRectF(box.rect[0] * self.width(), box.rect[1] * self.height(),
+                           (box.rect[2] - box.rect[0]) * self.width(),
+                           (box.rect[3] - box.rect[1]) * self.height())
+                p.drawRoundedRect(r, 4, 4)
 
         if shape is not None:
             p.save()
@@ -477,6 +1024,7 @@ class SelectionOverlay(QWidget):
         self.current = self.origin
         self.glow.begin(QPointF(e.position()))
         self._glow_timer.start(16)          # ~60fps
+        self._press_t = time.monotonic()
         self.update()
 
     def mouseMoveEvent(self, e):
@@ -506,6 +1054,13 @@ class SelectionOverlay(QWidget):
         self._tmp_mode = None
         self._glow_timer.stop()
 
+        # A press and release that barely moved is a tap, not a drag. Handle it
+        # before any shape logic, in every mode: on Android you tap whatever
+        # shape the tool happens to be in and still get the object.
+        if self._is_tap(e):
+            self._handle_tap()
+            return
+
         if mode == "lasso":
             if not self.path:
                 self.path = [self.origin]
@@ -530,6 +1085,19 @@ class SelectionOverlay(QWidget):
             if logg:
                 logg.info("lasso: %d points, bbox %.3f,%.3f-%.3f,%.3f",
                           len(poly), *rect)
+
+            # Scribble to search: a loose stroke drawn around one thing snaps
+            # to that thing. Only when the match is unambiguous - see
+            # object_for_stroke.
+            if self.snap and self.objects:
+                snapped = self.object_for_stroke(rect)
+                if snapped is not None:
+                    if logg:
+                        logg.info("scribble snapped to object %s", snapped.rect)
+                    self._reset()
+                    self.picked.emit((snapped.rect, None))
+                    return
+
             self._reset()
             self.picked.emit((rect, poly))
             return
@@ -543,6 +1111,39 @@ class SelectionOverlay(QWidget):
         self._reset()
         self.picked.emit((norm, None))
 
+    def _is_tap(self, e):
+        mods = e.modifiers()
+        if mods & (Qt.KeyboardModifier.ShiftModifier
+                   | Qt.KeyboardModifier.AltModifier):
+            return False          # a modifier is an explicit shape override
+        if self.origin is None:
+            return False
+        moved = (self.current - self.origin).manhattanLength()
+        if moved > TAP_SLOP:
+            return False
+        elapsed = (time.monotonic() - self._press_t) * 1000.0
+        return elapsed <= TAP_MS
+
+    def _handle_tap(self):
+        """Turn a tap into a selection of whatever object it landed on."""
+        nx = self.current.x() / float(max(1, self.width()))
+        ny = self.current.y() / float(max(1, self.height()))
+        box = self.object_at(nx, ny)
+        self._reset()
+        if box is not None:
+            if logg:
+                logg.info("tap selected object %s (score %.2f)", box.rect,
+                          box.score)
+            self.picked.emit((box.rect, None))
+            return
+        # No object under the finger. Rather than refuse the gesture, fall back
+        # to a small box around the tap: on a dense page the detector has
+        # nothing to offer, and a tight crop is still a useful search.
+        if logg:
+            logg.info("tap hit no object; using a small box at %.3f,%.3f",
+                      nx, ny)
+        self.picked.emit((self._tap_rect(nx, ny), None))
+
     def _reset(self):
         self.origin = self.current = None
         self.path = []
@@ -555,6 +1156,23 @@ class SelectionOverlay(QWidget):
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
             self.cancelled.emit()
+
+    def closeEvent(self, e):
+        # The detector thread is parented to this widget, so closing while it
+        # still holds a reference to the screenshot would abort the process
+        # ("QThread: Destroyed while thread is still running"). Drop the boxes
+        # first so a late signal cannot touch a half-torn-down widget.
+        scanner = getattr(self, "_scanner", None)
+        if scanner is not None:
+            try:
+                scanner.found.disconnect(self._on_objects)
+            except (TypeError, RuntimeError):
+                pass
+            scanner.wait(3000)
+            _SCANNERS.discard(scanner)
+            self._scanner = None
+        self.objects = []
+        super().closeEvent(e)
 
 
 # ----------------------------------------------------------------- lens work
@@ -655,6 +1273,42 @@ def crop_region(shot_path: str, region: tuple, poly: list | None = None) -> str:
 _ACTIVE_WORKERS = set()
 
 
+def decode_barcodes(crop_path):
+    """Decode QR codes / barcodes in a crop, if a decoder is installed.
+
+    Deliberately optional. zxing-cpp is a small self-contained wheel, but it is
+    not needed for anything else kcircle does, so it is an extra rather than a
+    requirement - install it with `uv pip install zxing-cpp` (or the `qr` extra)
+    and QR/barcode searching starts working.
+
+    Without it this returns an empty list and the crop is searched as an image,
+    exactly as before. Nothing here runs unless the module is importable.
+    """
+    try:
+        import zxingcpp
+    except Exception:                                # noqa: BLE001
+        return []
+    try:
+        from PIL import Image
+        with Image.open(crop_path) as im:
+            found = zxingcpp.read_barcodes(im.convert("RGB"))
+    except Exception as exc:                         # noqa: BLE001
+        if logg:
+            logg.debug("barcode decode failed: %s", exc)
+        return []
+
+    out = []
+    for item in found or []:
+        text = getattr(item, "text", "") or ""
+        if not text:
+            continue
+        fmt = str(getattr(item, "format", "") or "")
+        out.append((fmt, text))
+        if logg:
+            logg.info("barcode: %s -> %s", fmt, text[:120])
+    return out
+
+
 class LensWorker(QThread):
     done = pyqtSignal(dict)
     failed = pyqtSignal(str)
@@ -684,8 +1338,13 @@ class LensWorker(QThread):
                 finally:
                     await api.aclose()
 
+            # Decode locally and instantly: a QR code on screen should turn
+            # into its URL straight away rather than after a round trip.
+            barcodes = decode_barcodes(crop)
+
             r = asyncio.run(go())
             r["_crop"] = crop
+            r["_barcodes"] = barcodes
             self.done.emit(r)
         except Exception as exc:                     # noqa: BLE001
             self.failed.emit(f"{type(exc).__name__}: {exc}")
@@ -1238,6 +1897,7 @@ class ResultsPanel(QWidget):
         )
         self._settings0 = load_settings()
         self._mode = self._settings0.get("mode", "rect")
+        self._snap = bool(self._settings0.get("snap", True))
         self._ua_mode = self._settings0.get("ua", "desktop")
         self._scope = self._settings0.get("scope", "select")
         self._tab = self._settings0.get("tab", 1 if HAVE_WEBENGINE else 0)
@@ -1254,6 +1914,18 @@ class ResultsPanel(QWidget):
             "screen - the whole screen, no drawing"
         )
         self._refresh_scope_btn()
+        self.snap_btn = QPushButton()
+        self.snap_btn.clicked.connect(self.toggle_snap)
+        self.snap_btn.setToolTip(
+            "Tap and scribble assist.\n\n"
+            "When on, the screen is scanned while the overlay opens and objects "
+            "are outlined:\n"
+            "  - a click selects the object under it\n"
+            "  - a loose scribble snaps to the object it encircles\n\n"
+            "Dragging still works exactly as before; this only changes what a "
+            "click or a sloppy loop means."
+        )
+        self._refresh_snap_btn()
         self.ua_btn = QPushButton(f"UA: {self._ua_mode}")
         self.ua_btn.clicked.connect(self.toggle_ua)
         self.ua_btn.setToolTip(
@@ -1262,7 +1934,8 @@ class ResultsPanel(QWidget):
             "desktop - richer result set, restyled to fit\n\n"
             "Applies to the Visual matches tab."
         )
-        for b in (self.copy_btn, self.mode_btn, self.ua_btn, self.scope_btn):
+        for b in (self.copy_btn, self.mode_btn, self.ua_btn, self.scope_btn,
+                  self.snap_btn):
             b.setStyleSheet(
                 "QPushButton{background:#34313d; color:#e6e1e5;"
                 "border:none; border-radius:5px; padding:7px 11px;}"
@@ -1324,6 +1997,7 @@ class ResultsPanel(QWidget):
         self.shimmer.show()
 
         self._ocr = ""
+        self._barcodes = []
 
         self.place_near_cursor()
 
@@ -1479,9 +2153,15 @@ class ResultsPanel(QWidget):
             )
 
         ocr = (r.get("ocr_text") or "").strip()
+        barcodes = r.get("_barcodes") or []
+        self._barcodes = barcodes
         self._ocr = ocr
 
         parts = []
+        # A decoded code is the most reliable result there is, so lead with it.
+        for fmt, value in barcodes:
+            label = fmt.replace("BarcodeFormat.", "") if fmt else "code"
+            parts.append(f"[{label}]  {value}")
         if ocr:
             parts.append(ocr)
         tr = (r.get("translated_text") or "").strip()
@@ -1512,9 +2192,22 @@ class ResultsPanel(QWidget):
             logg.error("lens request failed: %s", msg)
 
     def copy_text(self):
+        """Copy whatever was read out of the selection.
+
+        Decoded codes come first when there are any: they are exact, whereas
+        OCR output can carry its own errors.
+        """
         from PyQt6.QtWidgets import QApplication
-        QApplication.clipboard().setText(self._ocr)
-        self.footer.setText("Copied to clipboard")
+        codes = [v for _f, v in (getattr(self, "_barcodes", None) or [])]
+        if codes:
+            payload = "\n".join(codes)
+            if self._ocr:
+                payload += "\n\n" + self._ocr
+        else:
+            payload = self._ocr
+        QApplication.clipboard().setText(payload)
+        self.footer.setText("Copied to clipboard" if payload
+                            else "Nothing to copy")
 
     def _refresh_mode_btn(self):
         names = {
@@ -1541,6 +2234,16 @@ class ResultsPanel(QWidget):
         names = {"select": "▣ select", "window": "▢ window",
                  "screen": "▦ screen"}
         self.scope_btn.setText(names.get(self._scope, self._scope))
+
+    def _refresh_snap_btn(self):
+        self.snap_btn.setText("◎ tap" if self._snap else "○ tap")
+
+    def toggle_snap(self):
+        self._snap = not self._snap
+        self._settings0["snap"] = self._snap
+        save_settings(self._settings0)
+        self._refresh_snap_btn()
+        self.footer.setText("Tap assist " + ("on" if self._snap else "off"))
 
     def cycle_scope(self):
         self._scope = CAPTURE_SCOPES[
