@@ -1952,6 +1952,8 @@ class ResultsPanel(QWidget):
         self._settings0 = load_settings()
         self._mode = self._settings0.get("mode", "rect")
         self._snap = bool(self._settings0.get("snap", True))
+        # Opt-in: overwriting the clipboard unasked can lose work.
+        self._autocopy = bool(self._settings0.get("autocopy", False))
         self._ua_mode = self._settings0.get("ua", "desktop")
         self._scope = self._settings0.get("scope", "select")
         self._tab = self._settings0.get("tab", 1 if HAVE_WEBENGINE else 0)
@@ -1980,6 +1982,16 @@ class ResultsPanel(QWidget):
             "click or a sloppy loop means."
         )
         self._refresh_snap_btn()
+        self.autocopy_btn = QPushButton()
+        self.autocopy_btn.clicked.connect(self.toggle_autocopy)
+        self.autocopy_btn.setToolTip(
+            "Copy the result as soon as it arrives.\n\n"
+            "Decoded QR/barcode values first, then any text read out of the "
+            "selection.\n\n"
+            "Off by default: it replaces whatever was already on the "
+            "clipboard. The Copy button always works regardless."
+        )
+        self._refresh_autocopy_btn()
         self.ua_btn = QPushButton(f"UA: {self._ua_mode}")
         self.ua_btn.clicked.connect(self.toggle_ua)
         self.ua_btn.setToolTip(
@@ -1989,7 +2001,7 @@ class ResultsPanel(QWidget):
             "Applies to the Visual matches tab."
         )
         for b in (self.copy_btn, self.mode_btn, self.ua_btn, self.scope_btn,
-                  self.snap_btn):
+                  self.snap_btn, self.autocopy_btn):
             b.setStyleSheet(
                 "QPushButton{background:#34313d; color:#e6e1e5;"
                 "border:none; border-radius:5px; padding:7px 11px;}"
@@ -2229,6 +2241,7 @@ class ResultsPanel(QWidget):
 
         self.text.setText("\n\n".join(parts) if parts else "No text found here.")
         self.status.setText(f"done · {r.get('detected_language') or 'unknown'}")
+        self._auto_copy()
 
         # the selection crop now exists - the visual tab can finally load
         if self.stack.currentIndex() == 1:
@@ -2245,23 +2258,45 @@ class ResultsPanel(QWidget):
         if logg:
             logg.error("lens request failed: %s", msg)
 
-    def copy_text(self):
-        """Copy whatever was read out of the selection.
+    def _copy_payload(self):
+        """Everything worth putting on the clipboard, as one string.
 
         Decoded codes come first when there are any: they are exact, whereas
         OCR output can carry its own errors.
         """
-        from PyQt6.QtWidgets import QApplication
         codes = [v for _f, v in (getattr(self, "_barcodes", None) or [])]
         if codes:
             payload = "\n".join(codes)
             if self._ocr:
                 payload += "\n\n" + self._ocr
-        else:
-            payload = self._ocr
+            return payload
+        return self._ocr
+
+    def copy_text(self):
+        from PyQt6.QtWidgets import QApplication
+        payload = self._copy_payload()
         QApplication.clipboard().setText(payload)
         self.footer.setText("Copied to clipboard" if payload
                             else "Nothing to copy")
+
+    def _auto_copy(self):
+        """Put the result on the clipboard without being asked.
+
+        Off by default, and deliberately so: silently replacing whatever the
+        user had copied is the kind of thing that loses work. Only fires when
+        there is something to copy, so a failed or empty search leaves the
+        clipboard alone.
+        """
+        if not getattr(self, "_autocopy", False):
+            return
+        payload = self._copy_payload()
+        if not payload:
+            return
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText(payload)
+        self.footer.setText("Copied to clipboard automatically")
+        if logg:
+            logg.info("auto-copied %d characters", len(payload))
 
     def _refresh_mode_btn(self):
         names = {
@@ -2288,6 +2323,16 @@ class ResultsPanel(QWidget):
         names = {"select": "▣ select", "window": "▢ window",
                  "screen": "▦ screen"}
         self.scope_btn.setText(names.get(self._scope, self._scope))
+
+    def _refresh_autocopy_btn(self):
+        self.autocopy_btn.setText("⧉ auto" if self._autocopy else "⧉")
+
+    def toggle_autocopy(self):
+        self._autocopy = not self._autocopy
+        self._settings0["autocopy"] = self._autocopy
+        save_settings(self._settings0)
+        self._refresh_autocopy_btn()
+        self.footer.setText("Auto-copy " + ("on" if self._autocopy else "off"))
 
     def _refresh_snap_btn(self):
         self.snap_btn.setText("◎ tap" if self._snap else "○ tap")

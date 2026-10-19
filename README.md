@@ -26,6 +26,9 @@ results land in a compact always-on-top panel.
 - **Text in any language.** Scribble over a run of text and it is read by
   Google's own OCR server-side, so every script and font works and your CPU
   does nothing. The result is selectable and copyable.
+- **Auto-copy** — flip `⧉` and the result lands on your clipboard the moment
+  it arrives, so you can paste without reaching for the panel. Off by default,
+  because silently replacing the clipboard can lose work.
 - **QR codes and barcodes** are decoded locally and shown above the OCR text.
   Install the optional decoder with `uv pip install zxing-cpp` (or the `qr`
   extra); without it QR images are still searched as pictures.
@@ -255,7 +258,7 @@ Command: /path/to/kcircle/kcircle
 
 | File | Purpose |
 | --- | --- |
-| `settings.json` | `{"ua": "desktop"\|"mobile", "mode": "corner"\|"rect"\|"lasso"\|"ellipse", "scope": "select"\|"window"\|"screen"}` |
+| `settings.json` | `{"ua": "desktop"\|"mobile", "mode": "corner"\|"rect"\|"lasso"\|"ellipse", "scope": "select"\|"window"\|"screen", "snap": true, "autocopy": false}` |
 | `geometry.json` | panel position and size |
 | `kcircle.log` | debug log, see below |
 
@@ -270,6 +273,7 @@ Environment:
 | `KCIRCLE_CROP_BG` | `white` to flatten a lasso crop onto an opaque background; the default keeps it transparent |
 | `KCIRCLE_REPROBE` | `1` to re-run the QtWebEngine health check |
 | `KCIRCLE_NO_BYPASS_WM` | `1` to drop `BypassWindowManagerHint` from the capture overlay |
+| `KCIRCLE_NO_SNAP` | `1` to disable the tap and scribble-to-search detection |
 
 Debug logging records the selection region, the crop size, how much of the
 upload the mask covers, and which file is sent to Google — enough to diagnose

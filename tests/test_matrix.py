@@ -525,6 +525,56 @@ def test_overlay_covers_the_screen():
           "the pointer is hidden while the overlay is up")
 
 
+def test_autocopy_setting():
+    print("\n== auto-copy to clipboard ==")
+    d = tempfile.mkdtemp(prefix="kcircle-ac-")
+    saved = k._settings_path
+    k._settings_path = lambda: os.path.join(d, "settings.json")
+    try:
+        # default must be opt-in: silently replacing the clipboard can lose work
+        t = new_stub(None)
+        t._settings0 = {}
+        t._autocopy = bool(t._settings0.get("autocopy", False))
+        check(t._autocopy is False, "auto-copy is off unless asked for")
+
+        t.footer = type("F", (), {"setText": lambda s, x: None})()
+        t.autocopy_btn = type("B", (), {"setText": lambda s, x: None})()
+
+        t.toggle_autocopy()
+        check(t._autocopy is True, "the toggle turns auto-copy on")
+        check(k.load_settings().get("autocopy") is True,
+              "the choice is persisted")
+        t.toggle_autocopy()
+        check(t._autocopy is False, "the toggle turns it back off")
+
+        # payload: codes first, then text
+        t._barcodes = [("QR Code", "https://example.com")]
+        t._ocr = "hello"
+        check(t._copy_payload() == "https://example.com\n\nhello",
+              "decoded codes lead the copied text")
+        t._barcodes = []
+        check(t._copy_payload() == "hello",
+              "with no codes, just the text is copied")
+
+        # never fire when there is nothing to copy
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText("sentinel")
+        t._ocr = ""
+        t._autocopy = True
+        t._auto_copy()
+        check(QApplication.clipboard().text() == "sentinel",
+              "an empty result leaves the clipboard untouched")
+
+        # and do copy when there is
+        t._ocr = "found me"
+        t._auto_copy()
+        check(QApplication.clipboard().text() == "found me",
+              "a real result is copied automatically")
+    finally:
+        k._settings_path = saved
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_ua():
     print("\n== user agents ==")
     check(set(k.UA_PRESETS) == {"mobile", "desktop"}, "both presets defined")
@@ -600,6 +650,11 @@ class PanelStub:
     cycle_mode = k.ResultsPanel.cycle_mode
     _refresh_scope_btn = k.ResultsPanel._refresh_scope_btn
     _refresh_mode_btn = k.ResultsPanel._refresh_mode_btn
+    _copy_payload = k.ResultsPanel._copy_payload
+    _auto_copy = k.ResultsPanel._auto_copy
+    toggle_autocopy = k.ResultsPanel.toggle_autocopy
+    _refresh_autocopy_btn = k.ResultsPanel._refresh_autocopy_btn
+    copy_text = k.ResultsPanel.copy_text
 
 
 def new_stub(crop, ua="desktop", scope="select", mode="rect", uploaded=None):
@@ -804,6 +859,7 @@ def main():
     test_overlay_hint(scene)
     test_object_detection()
     test_capture_ratio()
+    test_autocopy_setting()
     test_overlay_covers_the_screen()
     test_tap_selects_object()
     test_tap_without_object_falls_back()
