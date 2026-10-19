@@ -81,7 +81,10 @@ def new_overlay(scene, mode):
     were chosen for.
     """
     ov = k.SelectionOverlay(scene)
-    ov.resize(*SCREEN)
+    # The overlay pins itself to the virtual desktop so it cannot leave a gap
+    # on a scaled screen. Release that here so the geometry matches the scene
+    # the test coordinates were chosen for.
+    ov.setFixedSize(*SCREEN)
     ov.mode = mode
     ov.show()
     return ov
@@ -490,6 +493,38 @@ def test_barcode_support():
           f"zxing-cpp {'present' if available else 'absent'} (both supported)")
 
 
+def test_capture_ratio():
+    print("\n== scaled-display geometry ==")
+    # A capture is in device pixels while Qt talks in logical ones. On this
+    # machine that is 1920x1080 against 1600x900 - a factor of 1.2. Getting
+    # this wrong is what left a live strip (and a second panel) uncovered.
+    path = os.path.join(tempfile.gettempdir(), "_ratio.png")
+    Image.new("RGB", (1920, 1080), (20, 20, 20)).save(path)
+    desktop = type("R", (), {"width": lambda s: 1600})()
+    ratio = k._capture_ratio(path, desktop)
+    check(abs(ratio - 1.2) < 0.001, f"1920px over a 1600px desktop = {ratio:.3f}")
+
+    desktop2 = type("R", (), {"width": lambda s: 1920})()
+    check(abs(k._capture_ratio(path, desktop2) - 1.0) < 0.001,
+          "an unscaled display has ratio 1.0")
+    check(k._capture_ratio("/nonexistent.png", desktop) == 1.0,
+          "an unreadable capture falls back to 1.0 instead of raising")
+
+
+def test_overlay_covers_the_screen():
+    print("\n== overlay coverage ==")
+    ov = k.SelectionOverlay(object_scene())
+    desktop = k._virtual_desktop()
+    check(ov.width() == desktop.width() and ov.height() == desktop.height(),
+          f"overlay matches the virtual desktop {ov.width()}x{ov.height()}")
+    check(ov.minimumSize() == ov.maximumSize(),
+          "overlay size is pinned, so the compositor cannot leave a gap")
+    check(ov.minimumWidth() > 0 and ov.minimumHeight() > 0,
+          "the size lock is a real minimum, not a no-op")
+    check(ov.cursor().shape() == Qt.CursorShape.BlankCursor,
+          "the pointer is hidden while the overlay is up")
+
+
 def test_ua():
     print("\n== user agents ==")
     check(set(k.UA_PRESETS) == {"mobile", "desktop"}, "both presets defined")
@@ -768,6 +803,8 @@ def main():
     test_modifier_overrides(scene)
     test_overlay_hint(scene)
     test_object_detection()
+    test_capture_ratio()
+    test_overlay_covers_the_screen()
     test_tap_selects_object()
     test_tap_without_object_falls_back()
     test_drag_is_not_a_tap()

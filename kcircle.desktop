@@ -8,5 +8,8 @@ Icon=kcircle
 Terminal=false
 Categories=Utility;
 Keywords=circle;search;lens;ocr;translate;crop;screenshot;
-StartupNotify=true
+# No start-up feedback: Plasma otherwise pops an animated icon at the
+# pointer every time the overlay opens.
+StartupNotify=false
+X-KDE-StartupNotify=false
 X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2

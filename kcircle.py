@@ -253,6 +253,34 @@ def _virtual_desktop() -> QRect:
     return rect
 
 
+def _capture_ratio(shot_path, desktop=None) -> float:
+    """Capture pixels per logical (device-independent) screen pixel.
+
+    This is the number that has to be right, and it must not be taken from Qt.
+
+    On a scaled display Qt reports coordinates in device-independent units (a
+    1920x1080 panel at 1.2x is 1600x900 as far as Qt is concerned) while
+    spectacle captures real device pixels (1920x1080). Mixing the two offsets
+    everything by exactly the scale factor, which is how the overlay ends up
+    not quite covering the screen and leaves a live strip - with a second copy
+    of the panel - showing underneath it.
+
+    Deriving the ratio from the two things actually in hand, the captured image
+    and the virtual geometry, avoids trusting Qt's reported devicePixelRatio,
+    which is not reliable under Wayland/XWayland.
+    """
+    desktop = desktop or _virtual_desktop()
+    try:
+        from PIL import Image
+        with Image.open(shot_path) as im:
+            width = im.width
+    except Exception:                                # noqa: BLE001
+        return 1.0
+    if not width or not desktop.width():
+        return 1.0
+    return float(width) / float(desktop.width())
+
+
 def _spectacle_env() -> dict:
     """Environment for the spectacle child process.
 
@@ -789,8 +817,15 @@ class SelectionOverlay(QWidget):
         # keyPressEvent only fires when the widget has focus, which a frameless
         # always-on-top window does not get for free on Wayland
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setCursor(Qt.CursorShape.CrossCursor)
+        # Hide the pointer. The detected objects are outlined, so the cursor
+        # adds nothing, and on Plasma a visible pointer also drags the
+        # start-up feedback icon around with it.
+        self.setCursor(Qt.CursorShape.BlankCursor)
         self.setMouseTracking(True)
+        self._unblank = QTimer(self)
+        self._unblank.setSingleShot(True)
+        self._unblank.timeout.connect(
+            lambda: self.setCursor(Qt.CursorShape.CrossCursor))
 
         self.shot = QPixmap(shot_path)
         self.origin = None
@@ -821,7 +856,24 @@ class SelectionOverlay(QWidget):
         # entire virtual desktop, so an overlay sized to a single screen would
         # leave the rest of the capture unreachable and mis-map every
         # coordinate on a second monitor.
-        self.setGeometry(_virtual_desktop())
+        desktop = _virtual_desktop()
+        ratio = _capture_ratio(shot_path, desktop)
+        self.setGeometry(desktop)
+
+        # Pinning the size is what actually makes the overlay cover the screen.
+        # A window that is merely asked to be fullscreen can come back a few
+        # pixels short on a scaled output, which leaves the live desktop (and
+        # its panel) showing underneath - the "two taskbars" artefact. Fixing
+        # min and max to the same size makes the compositor honour it.
+        if os.environ.get("KCIRCLE_NO_SIZE_LOCK") != "1":
+            self.setFixedSize(desktop.width(), desktop.height())
+
+        if logg:
+            logg.info("overlay %dx%d logical, capture ratio %.3f "
+                      "(capture %dx%d device px)", desktop.width(),
+                      desktop.height(), ratio,
+                      int(desktop.width() * ratio),
+                      int(desktop.height() * ratio))
 
         mode_label = {
             "rect": "rectangle",
@@ -1025,6 +1077,8 @@ class SelectionOverlay(QWidget):
         self.glow.begin(QPointF(e.position()))
         self._glow_timer.start(16)          # ~60fps
         self._press_t = time.monotonic()
+        # bring the pointer back for anyone who wants to see where it is
+        self._unblank.start(1500)
         self.update()
 
     def mouseMoveEvent(self, e):

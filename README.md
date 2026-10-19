@@ -77,6 +77,39 @@ Text is never OCR'd here. Draw over text and the crop goes to Google's own
 endpoint via `chrome-lens-py`, exactly like the rest of the app, so all
 languages and fonts are handled by the service that owns them.
 
+## Scaled displays and screen coverage
+
+If the overlay ever failed to cover the whole screen — leaving a live strip
+along the bottom with a second copy of the panel visible under it — this is
+why, and what is done about it.
+
+Qt and `spectacle` count in different units. Qt talks in device-independent
+coordinates: on a 1920x1080 panel running at 1.2x, the desktop is 1600x900 as
+far as Qt is concerned. `spectacle` captures real device pixels: 1920x1080.
+Mixing the two offsets everything by exactly the scale factor.
+
+kcircle therefore never uses Qt's reported `devicePixelRatio` (which is not
+reliable under Wayland/XWayland — it reports 2.0 here, which is simply wrong).
+Instead it measures the ratio between the two things it actually has:
+
+```
+ratio = captured image width / virtual desktop width      # 1920 / 1600 = 1.2
+```
+
+Three things follow from that:
+
+- **The launcher prefers Wayland** when `WAYLAND_DISPLAY` is set, so Qt and
+  the screenshotter share one display server and one coordinate system.
+- **The overlay size is pinned** with `setFixedSize()`. Merely asking a window
+  to cover the screen can come back a few pixels short on a scaled output;
+  fixing min and max to the same value makes the compositor honour it. This is
+  the same trick NormCap uses.
+- **The pointer is hidden** over the overlay, since the detected objects are
+  already outlined. Set `KCIRCLE_NO_SIZE_LOCK=1` to opt out of the size pin.
+
+This is a scale bug, not a multi-monitor one — it happens on a single display
+just as easily.
+
 ## Capture scopes
 
 | Scope | Behaviour |
@@ -325,6 +358,11 @@ Command: /home/YOU/.local/share/kcircle/repo/kcircle
 The `X-KDE-DBUS-Restricted-Interfaces` line is only needed if you later switch
 capture to KWin's own `org.kde.KWin.ScreenShot2` API; the default `spectacle`
 path does not require it.
+
+The shipped `kcircle.desktop` sets `StartupNotify=false`. With start-up feedback
+on, Plasma pops an animated icon at the pointer every time the overlay opens,
+which looks like a stray cursor artefact. If you wrote the desktop entry by
+hand and see that icon, add the line.
 
 ## Tests
 
