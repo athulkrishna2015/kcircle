@@ -51,12 +51,18 @@ results land in a compact always-on-top panel.
   | `Alt` | circle |
   | `Shift` in `corner` mode | square |
 
-  Release it and you are back to your saved shape. The choice of saved shape —
-  `lasso`, `ellipse`, `circle`, `rect` or `corner` — is remembered between runs.
+  Swap straight from one modifier to another mid-stroke — no need to let go of
+  one first — and when several are held the order is `Alt` > `Ctrl` > `Shift`.
+  Release everything and you are back to your saved shape, which is remembered
+  between runs: `lasso`, `ellipse`, `circle`, `rect` or `corner`.
 - **Three capture scopes** — draw a region, grab the active window, or take
   the whole screen.
 - **Reusable.** The `+` button starts another capture; the panel gets out of
   the way while you select.
+- **Minimize without losing the result.** The `–` button hides the panel and
+  keeps the app alive with everything still loaded. Run kcircle again (the
+  same shortcut) and it comes straight back instead of grabbing the screen
+  a second time.
 - **User-agent switch** between Google's mobile and desktop presentations,
   remembered between runs.
 - **Last tab** — Text or Visual matches, reopened on the next launch.
@@ -277,6 +283,7 @@ Command: /path/to/kcircle/kcircle
 | `settings.json` | `{"ua": "desktop"\|"mobile", "mode": "lasso"\|"ellipse"\|"circle"\|"rect"\|"corner", "scope": "select"\|"window"\|"screen", "snap": true, "autocopy": false}` |
 | `geometry.json` | panel position and size |
 | `kcircle.log` | debug log, see below |
+| `run.pid` | PID of the running instance, so a second launch restores it |
 
 All are written from the panel buttons, so you rarely need to edit them.
 

@@ -629,6 +629,129 @@ def test_autocopy_setting():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_switch_modifier_mid_drag():
+    print("\n== switching modifier mid-drag ==")
+    CTRL = Qt.KeyboardModifier.ControlModifier
+    BOTH = SHIFT | CTRL
+
+    ov = new_overlay(object_scene(), "lasso")
+    ov.mousePressEvent(ev(PRESS, (400, 300), NONE))
+    ov.mouseMoveEvent(ev(MOVE, (600, 400), NONE))
+    check(ov._tmp_mode == "lasso", "starts free-form")
+
+    # straight from one modifier to another, without releasing either first
+    ov.mouseMoveEvent(ev(MOVE, (800, 520), SHIFT))
+    check(ov._tmp_mode == "rect", "Shift gives a rectangle")
+    ov.mouseMoveEvent(ev(MOVE, (900, 600), CTRL))
+    check(ov._tmp_mode == "ellipse",
+          "swapping to Ctrl mid-drag gives an ellipse")
+    ov.mouseMoveEvent(ev(MOVE, (980, 660), ALT))
+    check(ov._tmp_mode == "circle", "swapping to Alt mid-drag gives a circle")
+    r = ov._shape_rect()
+    check(r.width() == r.height(), "and the circle stays constrained")
+
+    # held together, the newest-pressed shape wins by a fixed precedence
+    ov.mouseMoveEvent(ev(MOVE, (1000, 700), BOTH))
+    check(ov._tmp_mode == "ellipse", "Shift+Ctrl resolves to the ellipse")
+    ov.mouseMoveEvent(ev(MOVE, (1020, 720), BOTH | ALT))
+    check(ov._tmp_mode == "circle", "Alt outranks the others when combined")
+
+    # and back down to free-form at the end
+    ov.mouseMoveEvent(ev(MOVE, (1040, 740), NONE))
+    check(ov._tmp_mode == "lasso", "releasing everything returns to free-form")
+    ov.mouseReleaseEvent(ev(RELEASE, (1040, 740), NONE))
+    check(ov._circle is False and ov._square is False,
+          "no stale shape constraint survives the release")
+
+
+def test_minimize_keeps_the_panel():
+    print("\n== minimize ==")
+    calls = []
+
+    class _Signal:
+        def emit(self):
+            calls.append("signal")
+
+    class MiniPanel:
+        minimize = k.ResultsPanel.minimize
+        restore = k.ResultsPanel.restore
+        def _cancel_reflow(self):
+            calls.append("cancel_reflow")
+
+        def __init__(self):
+            self._closing = False
+            self.visible = True
+            self.minimized = _Signal()
+
+        def hide(self):
+            self.visible = False
+            calls.append("hide")
+
+        def show(self):
+            self.visible = True
+            calls.append("show")
+
+        def raise_(self):
+            calls.append("raise")
+
+        def activateWindow(self):
+            calls.append("activate")
+
+        def setFocus(self, _reason):
+            calls.append("focus")
+
+    p = MiniPanel()
+    p.minimize()
+    check(p.visible is False, "minimizing hides the panel")
+    check("cancel_reflow" in calls, "it stops the pending reflow timers")
+    check(calls.count("hide") == 1 and "show" not in calls,
+          "minimizing does not tear the panel down")
+
+    p.restore()
+    check(p.visible is True, "restoring shows it again")
+    check("raise" in calls and "activate" in calls,
+          "restoring raises and focuses it, so it lands on top")
+
+    # a closing panel must not be resurrected
+    calls.clear()
+    p2 = MiniPanel()
+    p2.visible = False
+    p2._closing = True
+    p2.restore()
+    check(p2.visible is False and "show" not in calls and "raise" not in calls,
+          "a closed panel is not brought back")
+
+
+def test_single_instance_lock():
+    print("\n== single instance ==")
+    d = tempfile.mkdtemp(prefix="kcircle-run-")
+    saved = k._config_dir
+    k._config_dir = lambda: d
+    try:
+        check(k._running_instance() is None,
+              "no instance is recorded before the first launch")
+        k._claim_instance()
+        check(k._instance_pid() == os.getpid(),
+              "the running instance records itself")
+        check(k._running_instance() is None,
+              "a process never counts as its own other-instance")
+        # a stale file must not look alive
+        with open(k._instance_lock_path(), "w") as fh:
+            fh.write("999999")
+        check(k._running_instance() is None,
+              "a stale PID file is not mistaken for a live instance")
+        # a lock belonging to someone else must survive our exit
+        with open(k._instance_lock_path(), "w") as fh:
+            fh.write("4242")
+        k._release_instance()
+        check(k._instance_pid() == 4242,
+              "releasing leaves another instance's lock alone")
+        os.unlink(k._instance_lock_path())
+    finally:
+        k._config_dir = saved
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_ua():
     print("\n== user agents ==")
     check(set(k.UA_PRESETS) == {"mobile", "desktop"}, "both presets defined")
@@ -914,6 +1037,9 @@ def main():
     test_object_detection()
     test_capture_ratio()
     test_autocopy_setting()
+    test_switch_modifier_mid_drag()
+    test_minimize_keeps_the_panel()
+    test_single_instance_lock()
     test_overlay_covers_the_screen()
     test_tap_selects_object()
     test_tap_without_object_falls_back()

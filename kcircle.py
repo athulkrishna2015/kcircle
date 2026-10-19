@@ -16,6 +16,7 @@ import atexit
 import itertools
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1852,6 +1853,7 @@ class ResultsPanel(QWidget):
 
     finished = pyqtSignal()
     newCapture = pyqtSignal()
+    minimized = pyqtSignal()
 
     def __init__(self, shot_path: str, region: tuple, translate_to: str | None,
                  poly: list | None = None):
@@ -1891,10 +1893,15 @@ class ResultsPanel(QWidget):
         head_row.setSpacing(4)
         self.new_btn = QPushButton("+")
         self.new_btn.setToolTip("Start a new capture")
+        # Minimize keeps the app alive so the result stays loaded and can be
+        # brought straight back - closing quits, which is not the same thing.
+        self.min_btn = QPushButton("\u2013")
+        self.min_btn.setToolTip("Minimize (run kcircle again to restore)")
+        self.min_btn.clicked.connect(self.minimize)
         self.close_btn = QPushButton("\u00d7")
         self.close_btn.setToolTip("Close (Esc)")
         self.close_btn.clicked.connect(self.close)
-        for b in (self.new_btn, self.close_btn):
+        for b in (self.new_btn, self.min_btn, self.close_btn):
             b.setFixedWidth(28)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setStyleSheet(
@@ -1943,6 +1950,7 @@ class ResultsPanel(QWidget):
             f"color:{ACCENT}; font-size:13px; font-weight:600; padding:0 6px;")
         title.setFixedHeight(22)
         head_row.addWidget(title)
+        head_row.addWidget(self.min_btn)
         head_row.addWidget(self.close_btn)
         outer.addLayout(head_row)
 
@@ -2129,6 +2137,29 @@ class ResultsPanel(QWidget):
         _ACTIVE_WORKERS.add(self.worker)
         self.worker.finished.connect(lambda: _ACTIVE_WORKERS.discard(self.worker))
         self.worker.start()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+
+    def minimize(self):
+        """Get the panel out of the way without discarding the result.
+
+        Deliberately not showMinimized(): this is a frameless always-on-top
+        tool window with no taskbar entry, so there would be nothing to click
+        to get it back. Instead it just hides, and the app stays running with
+        the result loaded.
+        """
+        self._cancel_reflow()
+        self.hide()
+        self.minimized.emit()
+        if logg:
+            logg.info("panel minimized")
+
+    def restore(self):
+        """Bring a minimized panel back, anchored where it was left."""
+        if self._closing:
+            return
         self.show()
         self.raise_()
         self.activateWindow()
@@ -2567,6 +2598,75 @@ class ResultsPanel(QWidget):
 
 # ----------------------------------------------------------------- main
 
+def _instance_lock_path() -> str:
+    return os.path.join(_config_dir(), "run.pid")
+
+
+def _instance_pid():
+    """The PID recorded in the lock file, or None if there is no usable one."""
+    try:
+        with open(_instance_lock_path()) as fh:
+            pid = int(fh.read().strip())
+    except Exception:                                # noqa: BLE001
+        return None
+    return pid if pid > 0 else None
+
+
+def _pid_alive(pid) -> bool:
+    try:
+        os.kill(pid, 0)          # signal 0 only asks "is it alive?"
+    except OSError:
+        return False
+    return True
+
+
+def _running_instance():
+    """A live kcircle other than this process, or None.
+
+    Used to make a second launch restore the first one's panel instead of
+    freezing the screen again. There is no D-Bus service to talk to, so this
+    is a PID file plus a liveness check - enough for a single-user desktop
+    tool, and it keeps the app dependency-free.
+    """
+    pid = _instance_pid()
+    if pid is None or pid == os.getpid():
+        return None
+    return pid if _pid_alive(pid) else None
+
+
+def _claim_instance() -> None:
+    try:
+        with open(_instance_lock_path(), "w") as fh:
+            fh.write(str(os.getpid()))
+    except Exception:                                # noqa: BLE001
+        pass
+
+
+def _release_instance() -> None:
+    """Drop the lock, but only if it is ours - never another instance's."""
+    pid = _instance_pid()
+    if pid is not None and pid != os.getpid():
+        return
+    try:
+        os.unlink(_instance_lock_path())
+    except Exception:                                # noqa: BLE001
+        pass
+
+
+def _restore_running_instance() -> bool:
+    """Ask an already-running kcircle to show its panel. True if one was told."""
+    pid = _running_instance()
+    if pid is None:
+        return False
+    try:
+        # SIGUSR1 is unused by Python and Qt, so it is a safe "show yourself"
+        # signal that cannot be confused with a crash or a shutdown.
+        os.kill(pid, signal.SIGUSR1)
+        return True
+    except OSError:
+        return False
+
+
 def main():
     global logg, HAVE_WEBENGINE
     logg = setup_logging()
@@ -2581,9 +2681,30 @@ def main():
     logg.info("kcircle start (translate=%s, webengine=%s, settings=%s)",
               translate_to or "off", HAVE_WEBENGINE, load_settings())
 
+    # A second launch restores the first one's panel rather than grabbing the
+    # screen again. Checked before any capture work is done.
+    if _restore_running_instance():
+        if logg:
+            logg.info("another kcircle is already running; asked it to "
+                      "restore and exiting")
+        return
+    _claim_instance()
+    atexit.register(_release_instance)
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     state = {"panel": None, "overlay": None}
+
+    def restore_panel(*_):
+        """SIGUSR1 handler: bring the panel back after it was minimized."""
+        panel = state["panel"]
+        if panel is None or panel._closing:
+            return
+        if state["overlay"] is not None:
+            return                       # a selection is in progress
+        panel.restore()
+
+    signal.signal(signal.SIGUSR1, lambda *_: restore_panel())
 
     def begin_capture():
         """Hide the panel, freeze the screen, wait for a selection."""
