@@ -60,9 +60,10 @@ results land in a compact always-on-top panel.
 - **Reusable.** The `+` button starts another capture; the panel gets out of
   the way while you select.
 - **Minimize without losing the result.** The `–` button hides the panel and
-  keeps the app alive with everything still loaded. Run kcircle again (the
-  same shortcut) and it comes straight back instead of grabbing the screen
-  a second time.
+  keeps the app alive with everything still loaded. It goes to the **system
+  tray**, and a notification says so — a frameless always-on-top panel has no
+  taskbar entry, so without that it would simply vanish. Click the tray icon
+  to bring it back, or run kcircle again.
 - **User-agent switch** between Google's mobile and desktop presentations,
   remembered between runs.
 - **Last tab** — Text or Visual matches, reopened on the next launch.

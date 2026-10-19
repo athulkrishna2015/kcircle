@@ -44,8 +44,10 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QStackedWidget,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -2667,6 +2669,24 @@ def _restore_running_instance() -> bool:
         return False
 
 
+def _tray_icon():
+    """App icon for the tray, if we can find one.
+
+    Prefers the installed themed icon so the tray entry looks like everything
+    else in the panel, and falls back to the copy shipped next to the script.
+    """
+    from PyQt6.QtGui import QIcon
+    themed = QIcon.fromTheme("kcircle")
+    if not themed.isNull():
+        return themed
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("kcircle.svg", "kcircle.png"):
+        path = os.path.join(here, name)
+        if os.path.exists(path):
+            return QIcon(path)
+    return QIcon()
+
+
 def main():
     global logg, HAVE_WEBENGINE
     logg = setup_logging()
@@ -2696,15 +2716,49 @@ def main():
     state = {"panel": None, "overlay": None}
 
     def restore_panel(*_):
-        """SIGUSR1 handler: bring the panel back after it was minimized."""
+        """Bring the panel back after it was minimized.
+
+        Reached from the tray, from a second launch (SIGUSR1) and from the
+        SIGUSR1 path below, so all of them behave identically.
+        """
         panel = state["panel"]
         if panel is None or panel._closing:
             return
         if state["overlay"] is not None:
             return                       # a selection is in progress
         panel.restore()
+        tray.hideMessage()
 
     signal.signal(signal.SIGUSR1, lambda *_: restore_panel())
+
+    # The tray is where a minimized panel goes. Without it the minimize button
+    # would hide a frameless, always-on-top window that has no taskbar entry and
+    # no visible affordance - it would simply vanish, which is worse than not
+    # offering the option at all.
+    tray = QSystemTrayIcon(_tray_icon(), app)
+    tray.setToolTip("Circle to Search")
+    tray_menu = QMenu()
+    tray_menu.addAction("Restore panel", restore_panel)
+    # Resolved at click time, by which point begin_capture is defined below.
+    tray_menu.addAction("New search", lambda: begin_capture())
+    tray_menu.addSeparator()
+    tray_menu.addAction("Quit", app.quit)
+    tray.setContextMenu(tray_menu)
+    tray.activated.connect(
+        lambda reason: restore_panel()
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick)
+        else None)
+    if QSystemTrayIcon.isSystemTrayAvailable():
+        tray.show()
+    else:
+        # No tray on this desktop. Minimize still works via a second launch,
+        # but say so in the tooltip rather than vanishing silently.
+        if logg:
+            logg.info("no system tray; minimized panels are restored by "
+                      "launching kcircle again")
+        tray.setToolTip("Circle to Search (no tray available - launch "
+                        "kcircle again to restore)")
 
     def begin_capture():
         """Hide the panel, freeze the screen, wait for a selection."""
@@ -2734,6 +2788,15 @@ def main():
             new = ResultsPanel(shot_path, region, translate_to, poly)
             new.newCapture.connect(begin_capture)
             new.finished.connect(app.quit)
+
+            def on_minimized():
+                # Say where it went. A frameless always-on-top panel has no
+                # taskbar entry, so without this the window just disappears.
+                tray.showMessage(
+                    "Circle to Search",
+                    "Minimized - click the tray icon to restore",
+                    QSystemTrayIcon.MessageIcon.Information, 3000)
+            new.minimized.connect(on_minimized)
             state["panel"] = new
             new.show_results()
 

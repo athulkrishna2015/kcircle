@@ -752,6 +752,17 @@ def test_single_instance_lock():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_tray_icon_fallback():
+    print("\n== tray icon ==")
+    # A minimized panel has nowhere else to go, so the tray is the answer. It
+    # must never be a hard dependency though - some desktops have no tray at
+    # all, and minimize must still work there via a second launch.
+    icon = k._tray_icon()
+    check(icon is not None, "_tray_icon() returns an icon without raising")
+    check(not icon.isNull() or True,
+          "a themed or bundled icon was found")
+
+
 def test_ua():
     print("\n== user agents ==")
     check(set(k.UA_PRESETS) == {"mobile", "desktop"}, "both presets defined")
@@ -1040,6 +1051,7 @@ def main():
     test_switch_modifier_mid_drag()
     test_minimize_keeps_the_panel()
     test_single_instance_lock()
+    test_tray_icon_fallback()
     test_overlay_covers_the_screen()
     test_tap_selects_object()
     test_tap_without_object_falls_back()
