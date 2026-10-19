@@ -65,7 +65,12 @@ results land in a compact always-on-top panel.
   taskbar entry, so without that it would simply vanish. Click the tray icon
   to bring it back.
 
-  Launching kcircle always starts a new capture, never a restore.
+  Launching kcircle always starts a new capture, never a restore — this app
+  exists to capture, so the shortcut must never quietly do nothing.
+
+  On a desktop with **no system tray**, minimize still works but there is
+  nowhere to retrieve the panel from. `KCIRCLE_LOG=debug` says so at startup;
+  otherwise use `+` for a new capture or close the window outright.
 - **User-agent switch** between Google's mobile and desktop presentations,
   remembered between runs.
 - **Last tab** — Text or Visual matches, reopened on the next launch.
@@ -137,6 +142,23 @@ Three things follow from that:
 
 This is a scale bug, not a multi-monitor one — it happens on a single display
 just as easily.
+
+## The panel
+
+Every control writes itself to `settings.json`, so you set things once.
+
+| Button | What it does |
+| --- | --- |
+| `+` | start another capture (the panel hides while you select) |
+| `Text` / `Visual matches` | switch between native OCR results and embedded Google results |
+| results URL | the current Lens URL — copy it, edit it, open it elsewhere |
+| `Copy text` | decoded codes first, then any text, onto the clipboard |
+| `◎ tap` | tap-to-search and scribble snapping on/off |
+| `⧉` | auto-copy results as soon as they arrive |
+| `Shape:` | the shape used when no modifier is held |
+| `▣ select` | what gets captured next: region, active window or whole screen |
+| `UA:` | Google's mobile or desktop presentation |
+| `–` / `×` | minimize to the tray / close and quit |
 
 ## Capture scopes
 
@@ -283,7 +305,7 @@ Command: /path/to/kcircle/kcircle
 
 | File | Purpose |
 | --- | --- |
-| `settings.json` | `{"ua": "desktop"\|"mobile", "mode": "lasso"\|"ellipse"\|"circle"\|"rect"\|"corner", "scope": "select"\|"window"\|"screen", "snap": true, "autocopy": false}` |
+| `settings.json` | `{"ua": "desktop"\|"mobile", "mode": "lasso"\|"ellipse"\|"circle"\|"rect"\|"corner", "scope": "select"\|"window"\|"screen", "snap": true, "autocopy": false, "tab": 0\|1, "hint": true}` |
 | `geometry.json` | panel position and size |
 | `kcircle.log` | debug log, see below |
 
@@ -395,14 +417,32 @@ hand and see that icon, add the line.
 
 ## Tests
 
-A local matrix covers every scope, shape and user-agent combination, and
-asserts the invariants that have broken in the past: a selection never uploads
-the whole screenshot, the visual tab never uploads before the crop exists, and
-the stylesheet never overrides Google's result layout.
+A local matrix of 154 checks covers every scope, shape and user-agent
+combination, and asserts the invariants that have actually broken:
+
+- a selection never uploads the whole screenshot, and the visual tab never
+  uploads before the crop exists
+- the stylesheet never overrides Google's own result layout
+- a drag is never mistaken for a tap, and no modifier press is either
+- object detection finds the right regions, and finds *nothing* on a blank
+  screen rather than inventing targets
+- a scribble snaps only when it is unambiguous — a large lasso encircling
+  several objects is always honoured verbatim
+- the overlay matches the virtual desktop and its size is pinned, so a scaled
+  display cannot leave an uncovered strip
+- the pointer comes back on its own once the overlay is up
+- auto-copy leaves the clipboard alone when a search returns nothing
+- **launching always starts a capture** — a guard against any code path that
+  could turn the main gesture into a no-op again
 
 ```bash
-.venv/bin/python tests/test_matrix.py
+QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_matrix.py
 ```
+
+Headless runs cannot exercise compositor, mouse or tray behaviour. Those were
+verified against a real Wayland session — which is how the
+`QSystemTrayIcon.hideMessage` crash was caught, a bug 153 passing checks had
+missed. Changes in those areas need a real desktop to confirm.
 
 ## Credits and provenance
 
