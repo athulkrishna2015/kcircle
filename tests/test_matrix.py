@@ -521,8 +521,25 @@ def test_overlay_covers_the_screen():
           "overlay size is pinned, so the compositor cannot leave a gap")
     check(ov.minimumWidth() > 0 and ov.minimumHeight() > 0,
           "the size lock is a real minimum, not a no-op")
+    # Hidden only during the swap to the frozen frame, then back: you cannot
+    # draw around something you cannot see yourself pointing at.
     check(ov.cursor().shape() == Qt.CursorShape.BlankCursor,
-          "the pointer is hidden while the overlay is up")
+          "the pointer is hidden while the overlay is still coming up")
+    check(k.POINTER_REVEAL_MS <= 500,
+          f"the pointer returns promptly ({k.POINTER_REVEAL_MS}ms)")
+
+    ov.show()
+    QApplication.processEvents()
+    check(ov._unblank.isActive(),
+          "showing the overlay schedules the pointer to come back")
+    check(ov.cursor().shape() != Qt.CursorShape.BlankCursor
+          or ov._unblank.isActive(),
+          "the pointer is not left hidden indefinitely")
+
+    # and the reveal really does happen, without a mouse press in sight
+    ov._show_pointer()
+    check(ov.cursor().shape() == Qt.CursorShape.CrossCursor,
+          "the crosshair returns so the user can see where to draw")
 
 
 def test_autocopy_setting():

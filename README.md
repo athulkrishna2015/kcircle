@@ -107,8 +107,11 @@ Three things follow from that:
   to cover the screen can come back a few pixels short on a scaled output;
   fixing min and max to the same value makes the compositor honour it. This is
   the same trick NormCap uses.
-- **The pointer is hidden** over the overlay, since the detected objects are
-  already outlined. Set `KCIRCLE_NO_SIZE_LOCK=1` to opt out of the size pin.
+- **The pointer** is hidden only while the overlay is swapping to the frozen
+  frame, then comes straight back as a crosshair. You cannot draw around
+  something you cannot see yourself pointing at, so it is deliberately not
+  hidden for the whole session. Set `KCIRCLE_NO_SIZE_LOCK=1` to opt out of the
+  size pin.
 
 This is a scale bug, not a multi-monitor one — it happens on a single display
 just as easily.

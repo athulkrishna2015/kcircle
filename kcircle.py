@@ -419,6 +419,11 @@ OBJ_PAD = 0.004
 TAP_SLOP = 8
 TAP_MS = 450
 
+# How long the pointer stays hidden after the overlay opens. Long
+# enough to cover the swap to the frozen frame, short enough that it is
+# already back before the user starts aiming at something.
+POINTER_REVEAL_MS = 250
+
 # Scribble snapping. The object has to be at least this fraction inside what was
 # drawn, and the drawn region has to be at least this much larger than the
 # object. Both guards exist so that snapping never hijacks a deliberate lasso.
@@ -817,15 +822,20 @@ class SelectionOverlay(QWidget):
         # keyPressEvent only fires when the widget has focus, which a frameless
         # always-on-top window does not get for free on Wayland
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        # Hide the pointer. The detected objects are outlined, so the cursor
-        # adds nothing, and on Plasma a visible pointer also drags the
-        # start-up feedback icon around with it.
+        # The pointer is hidden only while the overlay is coming up, then
+        # brought straight back.
+        #
+        # Hiding it for the whole session is the wrong trade: you cannot draw
+        # around something you cannot see yourself pointing at. And on Plasma a
+        # pointer sitting over the freshly-mapped overlay also drags the
+        # start-up feedback icon along with it, which looks like a stray
+        # artefact. So: blank during the swap to the frozen frame, crosshair
+        # from the moment the user can actually see what they are aiming at.
         self.setCursor(Qt.CursorShape.BlankCursor)
         self.setMouseTracking(True)
         self._unblank = QTimer(self)
         self._unblank.setSingleShot(True)
-        self._unblank.timeout.connect(
-            lambda: self.setCursor(Qt.CursorShape.CrossCursor))
+        self._unblank.timeout.connect(self._show_pointer)
 
         self.shot = QPixmap(shot_path)
         self.origin = None
@@ -901,6 +911,19 @@ class SelectionOverlay(QWidget):
         self._glow_timer = QTimer(self)
         self._glow_timer.timeout.connect(self._glow_tick)
         self._hint = hint
+
+    def _show_pointer(self):
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def showEvent(self, e):
+        """Restore the pointer as soon as the overlay is actually up.
+
+        Keyed off showEvent rather than the first mouse press: the pointer has
+        to be visible *before* anything is pressed, because deciding where to
+        draw is precisely what the user is doing at that moment.
+        """
+        super().showEvent(e)
+        self._unblank.start(POINTER_REVEAL_MS)
 
     def _glow_tick(self):
         self.glow.t = (self.glow.t + 0.022) % 1.0
@@ -1077,8 +1100,6 @@ class SelectionOverlay(QWidget):
         self.glow.begin(QPointF(e.position()))
         self._glow_timer.start(16)          # ~60fps
         self._press_t = time.monotonic()
-        # bring the pointer back for anyone who wants to see where it is
-        self._unblank.start(1500)
         self.update()
 
     def mouseMoveEvent(self, e):
