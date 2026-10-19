@@ -47,15 +47,17 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QStackedWidget,
     QSystemTrayIcon,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 try:
-    from PyQt6.QtWebEngineCore import QWebEngineSettings
+    from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
     from PyQt6.QtWebEngineWidgets import QWebEngineView
     HAVE_WEBENGINE = True
 except Exception:                                    # noqa: BLE001
+    QWebEnginePage = None
     QWebEngineSettings = None
     QWebEngineView = None
     HAVE_WEBENGINE = False
@@ -1532,59 +1534,6 @@ def _allow_local_lens_upload(page) -> None:
 # header and the search box. Results are not restyled or re-wrapped at all;
 # they lay out as Google intends at whatever width the panel is. Widen the
 # panel if desktop results look cramped.
-# Page furniture that is never a result: site navigation and the footer.
-#
-# This deliberately does NOT touch <header> / [role="banner"] or the search
-# form. It used to, which made Google's own search box blink into view and then
-# vanish about a second later - the page painted normally, and this stylesheet
-# was injected on loadFinished (plus nudges at 900ms and 2200ms). kcircle's URL
-# bar shows the *result URL*, not a query field, so hiding Google's removed the
-# only way to refine a search without leaving the panel.
-_RESPONSIVE_CSS = """
-nav, [role="navigation"], #topnav, #gnav, div#hdt,
-.navigation, #foot, #search_footer {
-  display: none !important;
-}
-"""
-
-# Opt-in only, for anyone who wants the vertical space back.
-_HIDE_SEARCH_CSS = """
-header, [role="banner"], form[action="/search"], #search,
-textarea[name="q"], input[name="q"] {
-  display: none !important;
-}
-"""
-
-
-def _fit_width() -> bool:
-    """Scale results to fit the panel (default), or render them at 100%.
-
-    Fit-width keeps Google's ~652px column inside a narrow panel so there is
-    no horizontal scrolling. Turning it off renders at normal size, which is
-    easier to read and scrollable. Neither setting drops any results.
-    """
-    if os.environ.get("KCIRCLE_NO_FIT_WIDTH") == "1":
-        return False
-    return bool(load_settings().get("fit_width", True))
-
-
-def _hide_google_search() -> bool:
-    """Whether to strip Google's own search box out of the results.
-
-    Off by default. The box is a genuine control, and hiding page furniture is
-    a means of saving space rather than a feature in its own right.
-    """
-    if os.environ.get("KCIRCLE_NO_SEARCH_BAR") == "1":
-        return True
-    return not load_settings().get("google_search_bar", True)
-
-
-def _responsive_css() -> str:
-    """The stylesheet for the embedded results page, honouring the setting."""
-    if _hide_google_search():
-        return _RESPONSIVE_CSS + _HIDE_SEARCH_CSS
-    return _RESPONSIVE_CSS
-
 MOBILE_UA = (
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36"
@@ -1600,7 +1549,6 @@ UA_PRESETS = {"mobile": MOBILE_UA, "desktop": DESKTOP_UA}
 # Google lays desktop results out in a fixed-width column of roughly this
 # width. The panel is usually narrower, so the page is scaled down to fit and
 # Chromium does the wrapping natively, instead of us overriding its CSS.
-GOOGLE_DESKTOP_COLUMN = 652
 
 
 def _settings_path() -> str:
@@ -1625,36 +1573,6 @@ def save_settings(s: dict) -> None:
             json.dump(s, fh, indent=2)
     except Exception:                                # noqa: BLE001
         pass
-
-
-def _responsive_script() -> str:
-    """Install the (deliberately tiny) furniture-hiding stylesheet.
-
-    The tag is updated in place rather than removed and re-appended: swapping
-    it forces the page to restyle from scratch, which during Google's
-    progressive hydration blanks content that has not finished rendering.
-    """
-    return f"""
-(function(){{
-  var css = {_responsive_css()!r};
-  var s = document.getElementById('kcircle-css');
-  if (s) {{
-    if (s.textContent !== css) s.textContent = css;
-  }} else {{
-    s = document.createElement('style');
-    s.id = 'kcircle-css';
-    s.textContent = css;
-    (document.head || document.documentElement).appendChild(s);
-  }}
-  var m = document.querySelector('meta[name=viewport]');
-  if (!m) {{
-    m = document.createElement('meta');
-    m.name = 'viewport';
-    m.content = 'width=device-width, initial-scale=1';
-    document.head.appendChild(m);
-  }}
-  return 'ok';
-}})()"""
 
 
 # ----------------------------------------------------------------- results
@@ -1929,17 +1847,20 @@ class ResultsPanel(QWidget):
         outer.setContentsMargins(8, 6, 8, 6)
         outer.setSpacing(6)
 
-        # One header row holding +, the tab buttons, the title and x. A
-        # QTabWidget cannot sit inline with the buttons, so the tabs are
-        # toggle buttons driving a QStackedWidget instead.
+        # Two rows, because one could not hold everything.
+        #
+        # Row 1: window controls and page navigation. Row 2: the results tabs
+        # and the URL bar. They used to share a single row, which needed about
+        # 610px against a 320px minimum - so the URL bar was squeezed out of
+        # existence at any realistic panel size. Splitting it gives both room.
         head_row = QHBoxLayout()
-        head_row.setSpacing(4)
+        head_row.setSpacing(3)
         self.new_btn = QPushButton("+")
         self.new_btn.setToolTip("Start a new capture")
         # Minimize keeps the app alive so the result stays loaded and can be
         # brought straight back - closing quits, which is not the same thing.
         self.min_btn = QPushButton("\u2013")
-        self.min_btn.setToolTip("Minimize (run kcircle again to restore)")
+        self.min_btn.setToolTip("Minimize to the tray")
         self.min_btn.clicked.connect(self.minimize)
         self.close_btn = QPushButton("\u00d7")
         self.close_btn.setToolTip("Close (Esc)")
@@ -1955,6 +1876,61 @@ class ResultsPanel(QWidget):
         self.new_btn.clicked.connect(self.newCapture.emit)
         head_row.addWidget(self.new_btn)
 
+        # --- page navigation -------------------------------------------
+        # Deliberately plain glyphs: no icon theme dependency, and they line
+        # up with each other without shipping assets.
+        nav_qss = (
+            "QPushButton{background:#2b2932; color:#cfccd4;"
+            "border:none; border-radius:5px; font-size:14px; padding:2px 8px;}"
+            "QPushButton:hover{background:#38343f;}"
+            "QPushButton:disabled{color:#5c5866; background:#232128;}"
+            "QToolButton{background:#2b2932; color:#cfccd4;"
+            "border:none; border-radius:5px; font-size:14px; padding:2px 7px;}"
+            "QToolButton:hover{background:#38343f;}"
+        )
+        self.back_btn = QPushButton("\u2190")
+        self.back_btn.setToolTip("Back")
+        self.back_btn.clicked.connect(lambda: self._nav("back"))
+        self.fwd_btn = QPushButton("\u2192")
+        self.fwd_btn.setToolTip("Forward")
+        self.fwd_btn.clicked.connect(lambda: self._nav("forward"))
+        self.home_btn = QPushButton("\u2302")
+        self.home_btn.setToolTip("Home - back to the Lens results")
+        self.home_btn.clicked.connect(lambda: self._nav("home"))
+        self.hist_btn = QToolButton()
+        self.hist_btn.setText("\u22ee")
+        self.hist_btn.setToolTip("History")
+        self.hist_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.hist_btn.setStyleSheet(nav_qss)
+        self.reload_btn = QPushButton("\u21bb")
+        self.reload_btn.setToolTip("Reload")
+        self.reload_btn.clicked.connect(lambda: self._nav("reload"))
+        for b in (self.back_btn, self.fwd_btn, self.home_btn, self.reload_btn):
+            b.setStyleSheet(nav_qss)
+            b.setFixedWidth(30)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setEnabled(False)          # until there is somewhere to go
+        for b in (self.back_btn, self.fwd_btn, self.home_btn, self.hist_btn,
+                  self.reload_btn):
+            head_row.addWidget(b)
+
+        title = DragBar("Circle to Search")
+        title.setStyleSheet(
+            f"color:{ACCENT}; font-size:13px; font-weight:600; padding:0 6px;")
+        title.setFixedHeight(22)
+        # The label stretches, so it must be allowed to shrink. Left at its
+        # natural width it alone would push the navigation buttons off the
+        # panel at the minimum size.
+        title.setMinimumWidth(52)
+        # stretch, so there is always a grabbable strip to drag the window by
+        head_row.addWidget(title, 1)
+        head_row.addWidget(self.min_btn)
+        head_row.addWidget(self.close_btn)
+        outer.addLayout(head_row)
+
+        # --- row 2: tabs + URL ------------------------------------------
+        addr_row = QHBoxLayout()
+        addr_row.setSpacing(4)
         tab_qss = (
             "QPushButton{background:#26242c; color:#9a96a0;"
             "border:none; border-radius:5px; padding:4px 12px; font-size:13px;}"
@@ -1968,8 +1944,8 @@ class ResultsPanel(QWidget):
             b.setAutoExclusive(True)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setStyleSheet(tab_qss)
-        head_row.addWidget(self.tab_text)
-        head_row.addWidget(self.tab_visual)
+            addr_row.addWidget(self.tab_text)
+            addr_row.addWidget(self.tab_visual)
 
         # The current Lens result URL. Lens lands on a google.com/search
         # page with a long ?vsrid= token - worth showing so it can be copied,
@@ -1978,6 +1954,7 @@ class ResultsPanel(QWidget):
         self.url_bar.setPlaceholderText("results URL")
         self.url_bar.setClearButtonEnabled(True)
         self.url_bar.setFixedHeight(24)
+        self.url_bar.setMinimumWidth(120)
         self.url_bar.setStyleSheet(
             f"QLineEdit{{background:#1b1a20; color:{MUTED};"
             "border:1px solid #34313d; border-radius:5px;"
@@ -1986,16 +1963,8 @@ class ResultsPanel(QWidget):
         )
         self.url_bar.returnPressed.connect(self._url_go)
         self.url_bar.editingFinished.connect(self._url_go)
-        head_row.addWidget(self.url_bar, 1)
-
-        title = DragBar("Circle to Search")
-        title.setStyleSheet(
-            f"color:{ACCENT}; font-size:13px; font-weight:600; padding:0 6px;")
-        title.setFixedHeight(22)
-        head_row.addWidget(title)
-        head_row.addWidget(self.min_btn)
-        head_row.addWidget(self.close_btn)
-        outer.addLayout(head_row)
+        addr_row.addWidget(self.url_bar, 1)
+        outer.addLayout(addr_row)
 
         self.stack = QStackedWidget()
         self.stack.setStyleSheet(
@@ -2122,6 +2091,12 @@ class ResultsPanel(QWidget):
                 UA_PRESETS.get(self._ua_mode, MOBILE_UA))
             self.web.loadFinished.connect(self._on_web_loaded)
             self.web.urlChanged.connect(self._sync_url)
+            # Use Chromium's own menu (Reload, Open link in new tab/window,
+            # Save page, Save link, Copy link address) rather than leaving it
+            # to the default, which is not reliably raised on this widget.
+            self.web.setContextMenuPolicy(
+                Qt.ContextMenuPolicy.CustomContextMenu)
+            self.web.customContextMenuRequested.connect(self._web_menu)
             wp.addWidget(self.web, 1)
             # status floats over the view instead of stealing a layout row
             self.web_status = QLabel("Loading Google Lens results...", self.web)
@@ -2193,7 +2168,6 @@ class ResultsPanel(QWidget):
         to get it back. Instead it just hides, and the app stays running with
         the result loaded.
         """
-        self._cancel_reflow()
         self.hide()
         self.minimized.emit()
         if logg:
@@ -2256,52 +2230,7 @@ class ResultsPanel(QWidget):
             grip.raise_()
         self._place_shimmer()
         self._apply_mask()
-        # Google re-lays-out on its own breakpoints, so the injected CSS has
-        # to be re-applied whenever the panel changes width - otherwise
-        # resizing the window leaves the desktop layout stranded at its
-        # original fixed column
-        if self.web is not None:
-            self._resize_reflow()
         super().resizeEvent(e)
-
-    def _resize_reflow(self):
-        """Re-fit the page and re-apply the tiny stylesheet after a resize."""
-        self._apply_zoom()
-        self._apply_reflow()
-
-    def _apply_zoom(self):
-        """Let the engine do the wrapping: zoom Google's fixed results column
-        down to the panel width.
-
-        Google lays desktop results out in a fixed ~652px column. Rather than
-        overriding that with CSS - which fought the page while it was still
-        hydrating and made results vanish - scale the page so the column fits,
-        and let Chromium reflow and re-wrap everything natively, exactly as a
-        browser zoom does. Mobile results are already fluid, so they are left
-        at 1.0.
-
-        This scales, it never crops: the whole result set stays in the DOM and
-        is reachable by scrolling. At the default panel width it renders at
-        roughly 70%, which is small to read. Widen the panel past ~660px and
-        the zoom reaches 1.0 on its own, or set fit_width to false in
-        settings.json / KCIRCLE_NO_FIT_WIDTH=1 to force full size and scroll
-        sideways instead.
-        """
-        if self.web is None:
-            return
-        if self._ua_mode != "desktop" or not _fit_width():
-            self.web.setZoomFactor(1.0)
-            return
-        width = max(1, self.web.width())
-        zoom = min(1.0, width / GOOGLE_DESKTOP_COLUMN)
-        zoom = max(0.40, zoom)
-        # snap to whole percent so we are not reflowing on every pixel
-        zoom = round(zoom * 100) / 100.0
-        if abs(self.web.zoomFactor() - zoom) > 0.005:
-            self.web.setZoomFactor(zoom)
-            if logg:
-                logg.debug("zoom %.2f for a %dpx panel (column %dpx)",
-                           zoom, width, GOOGLE_DESKTOP_COLUMN)
 
     def place_near_cursor(self):
         """Honour a saved position; only auto-place on the first ever run."""
@@ -2487,7 +2416,6 @@ class ResultsPanel(QWidget):
 
         self.ua_btn.setText(f"UA: {self._ua_mode}")
         self.web.page().profile().setHttpUserAgent(UA_PRESETS[self._ua_mode])
-        self._apply_zoom()
 
         # re-run the search with the new identity
         self._load_results(force=True)
@@ -2497,41 +2425,9 @@ class ResultsPanel(QWidget):
         if self.web is None:
             return
         self.web_status.setText("Google Lens results" if ok else "load failed")
-        self._apply_reflow()
-        self._schedule_reflow()
-
-    def _apply_reflow(self):
-        """Inject the CSS. Safe to call repeatedly - it replaces its own tag."""
-        if self.web is None:
-            return
-        self.web.page().runJavaScript(_responsive_script())
-        self._apply_zoom()
-
-    def _schedule_reflow(self):
-        """Re-apply a few times as results hydrate in.
-
-        Only _on_web_loaded may call this. The timers must not call back into
-        it, or every tick would spawn three more and the panel would lock up
-        within seconds.
-        """
-        if self.web is None:
-            return
-        self._cancel_reflow()
-        self._reflow_timers = []
-        # results hydrate after loadFinished, so give them a couple of nudges
-        # - but few. Every re-apply during hydration risks catching a result
-        # container mid-render.
-        for delay in (900, 2200):
-            t = QTimer(self)
-            t.setSingleShot(True)
-            t.timeout.connect(self._apply_reflow)
-            t.start(delay)
-            self._reflow_timers.append(t)
-
-    def _cancel_reflow(self):
-        for t in getattr(self, "_reflow_timers", None) or []:
-            t.stop()
-        self._reflow_timers = []
+        self._nav_state()
+        if ok:
+            self.reload_btn.setEnabled(True)
 
     def _url_go(self):
         """Navigate the embedded view to whatever is typed in the bar.
@@ -2563,6 +2459,120 @@ class ResultsPanel(QWidget):
         if u and u != "about:blank":
             self.url_bar.setText(u)
             self.url_bar.setCursorPosition(0)
+        self._nav_state()
+
+    def _nav(self, action):
+        """Back / forward / home / reload on the embedded page."""
+        if self.web is None:
+            return
+        try:
+            if action == "back":
+                self.web.back()
+            elif action == "forward":
+                self.web.forward()
+            elif action == "reload":
+                self.web.reload()
+            elif action == "home":
+                # "Home" is the Lens result we came from, not a start page.
+                if self._uploaded_crop:
+                    self._load_results(force=True)
+        except Exception as exc:                     # noqa: BLE001
+            if logg:
+                logg.debug("nav %s failed: %s", action, exc)
+
+    def _nav_state(self):
+        """Grey out whatever cannot be done from here."""
+        if self.web is None:
+            return
+        hist = self.web.history()
+        self.back_btn.setEnabled(hist.canGoBack())
+        self.fwd_btn.setEnabled(hist.canGoForward())
+        self.home_btn.setEnabled(bool(getattr(self, "_uploaded_crop", None)))
+        self._fill_history_menu()
+
+    def _fill_history_menu(self):
+        """Populate the history dropdown from the engine's own list.
+
+        QWebEngineHistory exposes items() and goToItem() rather than an index
+        API, and the URL and title live on the item itself.
+        """
+        menu = self.hist_btn.menu()
+        if menu is None:
+            menu = QMenu(self.hist_btn)
+            self.hist_btn.setMenu(menu)
+        menu.clear()
+        if self.web is None:
+            return
+        hist = self.web.history()
+        try:
+            entries = []
+            for item in hist.items():
+                url = item.url().toString()
+                title = (item.title() or "").strip()
+                if url and url != "about:blank":
+                    entries.append((title or url, url))
+        except Exception as exc:                     # noqa: BLE001
+            if logg:
+                logg.debug("history unavailable: %s", exc)
+            entries = []
+        if not entries:
+            empty = menu.addAction("No history yet")
+            empty.setEnabled(False)
+            return
+        current = None
+        try:
+            item = hist.currentItem()
+            current = item.url().toString() if item is not None else None
+        except Exception:                            # noqa: BLE001
+            current = None
+        for title, url in reversed(entries[-25:]):
+            action = menu.addAction(("› " if url == current else "") + title[:70])
+            action.setToolTip(url)
+            action.triggered.connect(
+                lambda _checked=False, u=url: self._nav_go(u))
+
+    def _nav_go(self, url):
+        if self.web is not None and url:
+            self.web.load(QUrl(url))
+
+    def _web_menu(self, pos):
+        """A real browser context menu for the results page.
+
+        PyQt 6 exposes no createStandardContextMenu(), so the menu is assembled
+        from QWebEnginePage.WebAction instead - the same set Chromium offers:
+        Back, Forward, Reload, Copy, Copy link address, Save page, and the
+        open/save link actions. Note the name is DownloadLinkToDisk, not
+        SaveLinkToDisk; the latter does not exist and raised AttributeError on
+        every right-click.
+
+        Nothing is injected into the page to build this; it is a native menu.
+        """
+        if self.web is None:
+            return
+        page = self.web.page()
+        menu = QMenu(self.web)
+        act = page.triggerAction
+
+        def add(action, label, enabled=True):
+            item = menu.addAction(label)
+            item.setEnabled(enabled)
+            item.triggered.connect(lambda _c=False, a=action: act(a))
+
+        wa = QWebEnginePage.WebAction
+        add(wa.Back, "Back", self.back_btn.isEnabled())
+        add(wa.Forward, "Forward", self.fwd_btn.isEnabled())
+        add(wa.Reload, "Reload", self.reload_btn.isEnabled())
+        menu.addSeparator()
+        add(wa.Copy, "Copy")
+        add(wa.CopyLinkToClipboard, "Copy link address")
+        add(wa.Paste, "Paste")
+        menu.addSeparator()
+        add(wa.SavePage, "Save page…")
+        add(wa.DownloadLinkToDisk, "Save link as…")
+        menu.addSeparator()
+        add(wa.OpenLinkInNewTab, "Open link in new tab")
+        add(wa.OpenLinkInNewWindow, "Open link in new window")
+        menu.exec(self.web.mapToGlobal(pos))
 
     def _select_visual(self):
         """Switch to the Visual matches page and load it if we can."""
@@ -2616,7 +2626,6 @@ class ResultsPanel(QWidget):
             return
         self._uploaded_crop = self._crop
         self.web_status.setText("Contacting Google Lens...")
-        self._apply_zoom()
         if logg:
             logg.info("uploading selection: %s", self._crop)
         # load from a file URL rather than setHtml: a full-screen crop exceeds
@@ -2629,7 +2638,6 @@ class ResultsPanel(QWidget):
 
     def closeEvent(self, e):
         self._closing = True
-        self._cancel_reflow()
         self.shimmer.stop()
         # The Lens request may still be in flight. quit() is a no-op here (the
         # thread runs asyncio, not a Qt event loop), so wait briefly, and hand
@@ -2739,7 +2747,6 @@ def main():
         panel = state["panel"]
         if panel is not None:
             panel.hide()
-            panel._cancel_reflow()
         scope = load_settings().get("scope", "select")
         if scope not in CAPTURE_SCOPES:
             scope = "select"

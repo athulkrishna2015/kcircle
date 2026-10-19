@@ -152,6 +152,10 @@ Every control writes itself to `settings.json`, so you set things once.
 | Button | What it does |
 | --- | --- |
 | `+` | start another capture (the panel hides while you select) |
+| `←` / `→` | back / forward through the pages the panel has loaded |
+| `⌂` | reload the Lens result this panel came from |
+| `⋮` | history — every URL visited in this panel, newest first |
+| `⟳` | reload the current page |
 | `Text` / `Visual matches` | switch between native OCR results and embedded Google results |
 | results URL | the current Lens URL — copy it, edit it, open it elsewhere |
 | `Copy text` | decoded codes first, then any text, onto the clipboard |
@@ -161,6 +165,12 @@ Every control writes itself to `settings.json`, so you set things once.
 | `▣ select` | what gets captured next: region, active window or whole screen |
 | `UA:` | Google's mobile or desktop presentation |
 | `–` / `×` | minimize to the tray / close and quit |
+
+Right-clicking the results gives the usual browser menu — Back, Forward,
+Reload, Copy, Copy link address, Save page, and open/save link in a new tab or
+window. It is built from QtWebEngine's own `WebAction` values, because PyQt 6
+exposes no `createStandardContextMenu()`; nothing is injected into the page to
+produce it.
 
 ## Capture scopes
 
@@ -198,26 +208,24 @@ the drawn area and everything outside the stroke stays **transparent** — set
 `KCIRCLE_CROP_BG=white` if you need a solid background instead. Shapes without
 a mask (`rect`, `corner`, `ellipse`) send their bounding box as plain RGB.
 
-## Results are scaled, never cropped
+## The results page is never touched
 
-Google lays desktop results out in a fixed ~652px column. kcircle zooms the
-page so that column fits the panel, and lets Chromium re-wrap it natively —
-the same thing a browser zoom does, rather than fighting the layout with CSS.
+kcircle loads the page and gets out of the way. It does not inject CSS, does not
+run JavaScript, does not set a zoom factor, and does not restyle anything on
+load or on a timer.
 
-That is a **scale, not a crop**. The entire result set stays in the page and
-is reachable by scrolling; nothing is cut off. At the default panel width it
-simply renders smaller:
+This is not a neutral choice — it is the fix for a bug that shipped. An earlier
+version carried a stylesheet that hid `header`, `[role="banner"]` and Google's
+search form, and injected it on `loadFinished` plus nudges at 900 ms and 2200 ms.
+Google re-renders its results while they hydrate, so the sheet landed *after*
+the page had already painted: results appeared correctly and then blanked about
+a second later, leaving only the parts of the page that were never inside a
+`<header>`. Every one of those rules is gone.
 
-| Panel width | Zoom |
-| --- | --- |
-| 320px | 0.49 |
-| 460px (default) | 0.71 |
-| 660px and up | 1.00 |
-
-So if the text is too small to read, widen the panel past ~660px and the zoom
-reaches 1.00 on its own — no setting needed. Or force full size and scroll
-sideways with `KCIRCLE_NO_FIT_WIDTH=1`, or `"fit_width": false` in
-`settings.json`.
+The practical consequence is that what you see is what a real browser shows, at
+100%, with horizontal scrolling if the panel is narrower than the layout. Widen
+the panel for a better fit. There are no settings to tune, because there is
+nothing left to tune.
 
 ## Why two tabs
 
@@ -228,17 +236,11 @@ Google serves a different layout per user agent, and the useful ones trade off:
 | `mobile` | often thin — Google tends to answer with location and local junk | fluid |
 | `desktop` | **richer** — real AI Overview and visual matches | fixed ~652px column |
 
-kcircle ships `desktop` and fits it to the panel using the browser's own page
-zoom: when the panel is narrower than Google's fixed column, the page is scaled
-down so the column fits, and **Chromium does all the wrapping and re-wrapping
-itself**. Resizing re-fits on the fly. This is deliberately the opposite of
-overriding Google's CSS — an earlier version carried ~70 lines of `!important`
-rules to force the layout, which fought the page while it was still loading and
-made results appear and then vanish. The only CSS kcircle injects now hides
-Google's own header and search box, which are never results.
-
-If desktop results look cramped, widen the panel — or switch to `mobile`, which
-reflows natively but often returns less.
+`desktop` is the default because it returns visibly more. Its layout is a
+narrower fixed column than the panel, so on a narrow panel you may need to
+scroll sideways — that is the same as resizing a browser window, and it is
+preferable to scaling the text down for you. Switch to `mobile` if you would
+rather have a layout that reflows natively, at the cost of thinner results.
 
 ## Install
 
@@ -344,8 +346,6 @@ Environment:
 | `KCIRCLE_REPROBE` | `1` to re-run the QtWebEngine health check |
 | `KCIRCLE_NO_BYPASS_WM` | `1` to drop `BypassWindowManagerHint` from the capture overlay |
 | `KCIRCLE_NO_SNAP` | `1` to disable the tap and scribble-to-search detection |
-| `KCIRCLE_NO_SEARCH_BAR` | `1` to hide Google's own search box in the results |
-| `KCIRCLE_NO_FIT_WIDTH` | `1` to render results at 100% instead of fitting them to the panel |
 
 Debug logging records the selection region, the crop size, how much of the
 upload the mask covers, and which file is sent to Google — enough to diagnose
@@ -366,7 +366,8 @@ tail -f ~/.config/kcircle/kcircle.log
    stroke, so **only the pixels you actually selected are transmitted**.
 4. The crop goes to `chrome-lens-py` for OCR and translation, and separately
    to `lens.google.com/v3/upload` for the full search results.
-5. Those results render in a `QWebEngineView`, page-zoomed to fit the panel.
+5. Those results render in a `QWebEngineView` exactly as a browser would show
+   them, at 100%, untouched.
 
 A note on moving the window: on Wayland a client cannot set its own toplevel
 position, so kcircle uses Qt's `startSystemMove()` and lets KWin drive the
@@ -374,17 +375,18 @@ drag. Resizing uses a custom corner grip for the same reason.
 
 ## Installing to your system
 
-To run it from the app launcher rather than a terminal, install it somewhere
-permanent and register a desktop entry.
+**Run it from the checkout you already have.** kcircle does not need a second
+copy. A separate clone under `~/.local/share` means two trees exist, and the
+one you are testing is not necessarily the one the launcher starts — which is
+not a hypothetical. An earlier version of this very app was being fixed in the
+working tree while the installed clone stayed three commits behind, so a bug
+report came with screenshots of code that had already been replaced.
+
+Point the launcher at the repository instead:
 
 ```bash
-# 1. put it where it will live
-mkdir -p ~/.local/share/kcircle
-git clone https://github.com/athulkrishna2015/kcircle.git \
-    ~/.local/share/kcircle/repo
-
-# 2. build the environment
-cd ~/.local/share/kcircle/repo
+# build the environment once, in your checkout
+cd /path/to/kcircle
 uv venv
 uv pip install -r requirements.txt
 ```
@@ -392,7 +394,7 @@ uv pip install -r requirements.txt
 Install the icon at every size the launcher wants:
 
 ```bash
-cd ~/.local/share/kcircle/repo
+cd /path/to/kcircle
 for s in 16 22 32 48 64 128 256; do
   mkdir -p ~/.local/share/icons/hicolor/${s}x${s}/apps
   rsvg-convert -w $s -h $s kcircle.svg \
@@ -414,12 +416,13 @@ Type=Application
 Name=Circle to Search
 GenericName=Screen region search
 Comment=Draw around anything on screen and search it with Google Lens
-Exec=/home/YOU/.local/share/kcircle/repo/kcircle
+Exec=/path/to/kcircle/kcircle
 Icon=kcircle
 Terminal=false
 Categories=Utility;
 Keywords=circle;search;lens;ocr;translate;crop;screenshot;
-StartupNotify=true
+StartupNotify=false
+X-KDE-StartupNotify=false
 X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 EOF
 update-desktop-database ~/.local/share/applications
@@ -428,8 +431,17 @@ update-desktop-database ~/.local/share/applications
 Then bind a shortcut in *System Settings → Shortcuts → Custom Shortcuts*:
 
 ```
-Command: /home/YOU/.local/share/kcircle/repo/kcircle
+Command: /path/to/kcircle/kcircle
 ```
+
+After that, `git pull` in the checkout is all it takes to update the installed
+app — there is nothing else to reinstall.
+
+If you must keep kcircle on a Windows-formatted (ntfs) partition, be aware that
+Chromium does a lot of small-file I/O at startup. Measured cold-import cost
+there is ~0.17 s against ~0.15 s on the native filesystem, which is small
+enough not to matter — but the code itself is worth keeping on Linux-native
+storage.
 
 The `X-KDE-DBUS-Restricted-Interfaces` line is only needed if you later switch
 capture to KWin's own `org.kde.KWin.ScreenShot2` API; the default `spectacle`
@@ -442,7 +454,7 @@ hand and see that icon, add the line.
 
 ## Tests
 
-A local matrix of 154 checks covers every scope, shape and user-agent
+A local matrix of 153 checks covers every scope, shape and user-agent
 combination, and asserts the invariants that have actually broken:
 
 - a selection never uploads the whole screenshot, and the visual tab never
@@ -469,6 +481,12 @@ verified against a real Wayland session — which is how the
 `QSystemTrayIcon.hideMessage` crash was caught, a bug 153 passing checks had
 missed. Changes in those areas need a real desktop to confirm.
 
+The same blind spot applies to QtWebEngine API calls: an off-screen suite cannot
+tell you that `WebAction.SaveLinkToDisk` does not exist until a user
+right-clicks. Every `WebAction` used by the context menu is checked against the
+real engine at runtime, because a menu that raises `AttributeError` on every
+invocation looks identical to "no menu appeared" in the offscreen matrix.
+
 ## Credits and provenance
 
 Written from scratch. Attribution:
@@ -494,6 +512,10 @@ official feature does.
 - Google's endpoints are unofficial and may change without notice.
 - The selection is a rectangle, ellipse or freehand lasso — not the pressure-
   or curvature-aware stroke of the Android original.
+- Google's desktop presentation is a fixed ~652px column. On a narrower panel
+  the results scroll sideways rather than being scaled down — kcircle does not
+  set a zoom factor, because the old zoom-plus-CSS approach is what made
+  results vanish. Widen the panel, or switch to the `mobile` UA.
 - The Visual matches tab needs QtWebEngine. If the bundled engine is missing
   or crashes (some distro Qt/PyQt6 combinations abort on load), kcircle detects
   that in a subprocess at startup and falls back to OCR-only rather than
