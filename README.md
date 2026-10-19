@@ -63,7 +63,9 @@ results land in a compact always-on-top panel.
   keeps the app alive with everything still loaded. It goes to the **system
   tray**, and a notification says so — a frameless always-on-top panel has no
   taskbar entry, so without that it would simply vanish. Click the tray icon
-  to bring it back, or run kcircle again.
+  to bring it back.
+
+  Launching kcircle always starts a new capture, never a restore.
 - **User-agent switch** between Google's mobile and desktop presentations,
   remembered between runs.
 - **Last tab** — Text or Visual matches, reopened on the next launch.
@@ -284,7 +286,6 @@ Command: /path/to/kcircle/kcircle
 | `settings.json` | `{"ua": "desktop"\|"mobile", "mode": "lasso"\|"ellipse"\|"circle"\|"rect"\|"corner", "scope": "select"\|"window"\|"screen", "snap": true, "autocopy": false}` |
 | `geometry.json` | panel position and size |
 | `kcircle.log` | debug log, see below |
-| `run.pid` | PID of the running instance, so a second launch restores it |
 
 All are written from the panel buttons, so you rarely need to edit them.
 

@@ -16,7 +16,6 @@ import atexit
 import itertools
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -2600,75 +2599,6 @@ class ResultsPanel(QWidget):
 
 # ----------------------------------------------------------------- main
 
-def _instance_lock_path() -> str:
-    return os.path.join(_config_dir(), "run.pid")
-
-
-def _instance_pid():
-    """The PID recorded in the lock file, or None if there is no usable one."""
-    try:
-        with open(_instance_lock_path()) as fh:
-            pid = int(fh.read().strip())
-    except Exception:                                # noqa: BLE001
-        return None
-    return pid if pid > 0 else None
-
-
-def _pid_alive(pid) -> bool:
-    try:
-        os.kill(pid, 0)          # signal 0 only asks "is it alive?"
-    except OSError:
-        return False
-    return True
-
-
-def _running_instance():
-    """A live kcircle other than this process, or None.
-
-    Used to make a second launch restore the first one's panel instead of
-    freezing the screen again. There is no D-Bus service to talk to, so this
-    is a PID file plus a liveness check - enough for a single-user desktop
-    tool, and it keeps the app dependency-free.
-    """
-    pid = _instance_pid()
-    if pid is None or pid == os.getpid():
-        return None
-    return pid if _pid_alive(pid) else None
-
-
-def _claim_instance() -> None:
-    try:
-        with open(_instance_lock_path(), "w") as fh:
-            fh.write(str(os.getpid()))
-    except Exception:                                # noqa: BLE001
-        pass
-
-
-def _release_instance() -> None:
-    """Drop the lock, but only if it is ours - never another instance's."""
-    pid = _instance_pid()
-    if pid is not None and pid != os.getpid():
-        return
-    try:
-        os.unlink(_instance_lock_path())
-    except Exception:                                # noqa: BLE001
-        pass
-
-
-def _restore_running_instance() -> bool:
-    """Ask an already-running kcircle to show its panel. True if one was told."""
-    pid = _running_instance()
-    if pid is None:
-        return False
-    try:
-        # SIGUSR1 is unused by Python and Qt, so it is a safe "show yourself"
-        # signal that cannot be confused with a crash or a shutdown.
-        os.kill(pid, signal.SIGUSR1)
-        return True
-    except OSError:
-        return False
-
-
 def _tray_icon():
     """App icon for the tray, if we can find one.
 
@@ -2701,16 +2631,6 @@ def main():
     logg.info("kcircle start (translate=%s, webengine=%s, settings=%s)",
               translate_to or "off", HAVE_WEBENGINE, load_settings())
 
-    # A second launch restores the first one's panel rather than grabbing the
-    # screen again. Checked before any capture work is done.
-    if _restore_running_instance():
-        if logg:
-            logg.info("another kcircle is already running; asked it to "
-                      "restore and exiting")
-        return
-    _claim_instance()
-    atexit.register(_release_instance)
-
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     state = {"panel": None, "overlay": None}
@@ -2718,8 +2638,11 @@ def main():
     def restore_panel(*_):
         """Bring the panel back after it was minimized.
 
-        Reached from the tray, from a second launch (SIGUSR1) and from the
-        SIGUSR1 path below, so all of them behave identically.
+        Only reachable from the tray, on purpose. This app's primary action is
+        "capture the screen", so launching it must always start a capture -
+        a previous version made a second launch mean "restore" instead, which
+        quietly turned the main gesture into a no-op whenever an instance was
+        already alive. The tray is the only thing that should restore.
         """
         panel = state["panel"]
         if panel is None or panel._closing:
@@ -2727,9 +2650,9 @@ def main():
         if state["overlay"] is not None:
             return                       # a selection is in progress
         panel.restore()
-        tray.hideMessage()
-
-    signal.signal(signal.SIGUSR1, lambda *_: restore_panel())
+        # No explicit dismissal: Qt 6 dropped QSystemTrayIcon.hideMessage(), and
+        # the notification expires on its own. Calling it raised AttributeError
+        # and made the tray icon - the only way back from minimize - crash.
 
     # The tray is where a minimized panel goes. Without it the minimize button
     # would hide a frameless, always-on-top window that has no taskbar entry and
@@ -2752,13 +2675,11 @@ def main():
     if QSystemTrayIcon.isSystemTrayAvailable():
         tray.show()
     else:
-        # No tray on this desktop. Minimize still works via a second launch,
-        # but say so in the tooltip rather than vanishing silently.
+        # No tray on this desktop. Minimize still works, but there is then
+        # nowhere to retrieve the panel from - so say so plainly rather than
+        # letting the window vanish.
         if logg:
-            logg.info("no system tray; minimized panels are restored by "
-                      "launching kcircle again")
-        tray.setToolTip("Circle to Search (no tray available - launch "
-                        "kcircle again to restore)")
+            logg.info("no system tray: a minimized panel cannot be restored")
 
     def begin_capture():
         """Hide the panel, freeze the screen, wait for a selection."""

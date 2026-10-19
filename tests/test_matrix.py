@@ -722,41 +722,23 @@ def test_minimize_keeps_the_panel():
           "a closed panel is not brought back")
 
 
-def test_single_instance_lock():
-    print("\n== single instance ==")
-    d = tempfile.mkdtemp(prefix="kcircle-run-")
-    saved = k._config_dir
-    k._config_dir = lambda: d
-    try:
-        check(k._running_instance() is None,
-              "no instance is recorded before the first launch")
-        k._claim_instance()
-        check(k._instance_pid() == os.getpid(),
-              "the running instance records itself")
-        check(k._running_instance() is None,
-              "a process never counts as its own other-instance")
-        # a stale file must not look alive
-        with open(k._instance_lock_path(), "w") as fh:
-            fh.write("999999")
-        check(k._running_instance() is None,
-              "a stale PID file is not mistaken for a live instance")
-        # a lock belonging to someone else must survive our exit
-        with open(k._instance_lock_path(), "w") as fh:
-            fh.write("4242")
-        k._release_instance()
-        check(k._instance_pid() == 4242,
-              "releasing leaves another instance's lock alone")
-        os.unlink(k._instance_lock_path())
-    finally:
-        k._config_dir = saved
-        shutil.rmtree(d, ignore_errors=True)
+def test_launching_always_captures():
+    print("\n== launching always captures ==")
+    # Regression guard. A previous version made a second launch mean "restore
+    # the minimized panel" and exit, which silently turned the app's primary
+    # gesture into a no-op whenever an instance was already alive. Nothing may
+    # reintroduce a code path that can make a launch do nothing.
+    src = open("kcircle.py").read()
+    for gone in ("_restore_running_instance", "SIGUSR1", "_claim_instance",
+                 "_running_instance"):
+        check(gone not in src, f"the {gone} no-op path is gone")
 
 
 def test_tray_icon_fallback():
     print("\n== tray icon ==")
     # A minimized panel has nowhere else to go, so the tray is the answer. It
     # must never be a hard dependency though - some desktops have no tray at
-    # all, and minimize must still work there via a second launch.
+    # all, and the app must still start and capture without it.
     icon = k._tray_icon()
     check(icon is not None, "_tray_icon() returns an icon without raising")
     check(not icon.isNull() or True,
@@ -1050,7 +1032,7 @@ def main():
     test_autocopy_setting()
     test_switch_modifier_mid_drag()
     test_minimize_keeps_the_panel()
-    test_single_instance_lock()
+    test_launching_always_captures()
     test_tray_icon_fallback()
     test_overlay_covers_the_screen()
     test_tap_selects_object()
