@@ -45,6 +45,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMenu,
     QPushButton,
+    QSizePolicy,
     QStackedWidget,
     QSystemTrayIcon,
     QToolButton,
@@ -1832,6 +1833,14 @@ class ResultsPanel(QWidget):
         self.setMinimumSize(MIN_PANEL_W, MIN_PANEL_H)
         self.resize(PANEL_W, PANEL_H)
         self._restore_geometry()
+        # Geometry used to be written only from closeEvent, so a resize was
+        # lost whenever the app was killed, crashed, or closed from the tray
+        # instead of by closing the panel. Saving on a debounce keeps the file
+        # current at all times and costs one write per drag, not per pixel.
+        self._geom_timer = QTimer(self)
+        self._geom_timer.setSingleShot(True)
+        self._geom_timer.setInterval(400)
+        self._geom_timer.timeout.connect(self._save_geometry)
         self._apply_mask()
 
         self.shot_path = shot_path
@@ -1905,7 +1914,8 @@ class ResultsPanel(QWidget):
         self.reload_btn = QPushButton("\u21bb")
         self.reload_btn.setToolTip("Reload")
         self.reload_btn.clicked.connect(lambda: self._nav("reload"))
-        for b in (self.back_btn, self.fwd_btn, self.home_btn, self.reload_btn):
+        for b in (self.back_btn, self.fwd_btn, self.home_btn,
+                  self.reload_btn, self.hist_btn):
             b.setStyleSheet(nav_qss)
             b.setFixedWidth(30)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1914,57 +1924,42 @@ class ResultsPanel(QWidget):
                   self.reload_btn):
             head_row.addWidget(b)
 
-        title = DragBar("Circle to Search")
-        title.setStyleSheet(
-            f"color:{ACCENT}; font-size:13px; font-weight:600; padding:0 6px;")
-        title.setFixedHeight(22)
-        # The label stretches, so it must be allowed to shrink. Left at its
-        # natural width it alone would push the navigation buttons off the
-        # panel at the minimum size.
-        title.setMinimumWidth(52)
-        # stretch, so there is always a grabbable strip to drag the window by
-        head_row.addWidget(title, 1)
-        head_row.addWidget(self.min_btn)
-        head_row.addWidget(self.close_btn)
-        outer.addLayout(head_row)
-
-        # --- row 2: tabs + URL ------------------------------------------
-        addr_row = QHBoxLayout()
-        addr_row.setSpacing(4)
-        tab_qss = (
-            "QPushButton{background:#26242c; color:#9a96a0;"
-            "border:none; border-radius:5px; padding:4px 12px; font-size:13px;}"
-            "QPushButton:checked{background:#3a3742; color:#e6e1e5;}"
-            "QPushButton:hover{background:#332f3c;}"
-        )
-        self.tab_text = QPushButton("Text")
-        self.tab_visual = QPushButton("Visual matches")
-        for b in (self.tab_text, self.tab_visual):
-            b.setCheckable(True)
-            b.setAutoExclusive(True)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setStyleSheet(tab_qss)
-            addr_row.addWidget(self.tab_text)
-            addr_row.addWidget(self.tab_visual)
-
-        # The current Lens result URL. Lens lands on a google.com/search
-        # page with a long ?vsrid= token - worth showing so it can be copied,
-        # edited, or opened in a real browser.
+        # The current Lens result URL, beside the navigation it belongs to.
+        # Lens lands on a google.com/search page with a long ?vsrid= token -
+        # worth showing so it can be copied, edited, or opened elsewhere.
         self.url_bar = QLineEdit()
         self.url_bar.setPlaceholderText("results URL")
         self.url_bar.setClearButtonEnabled(True)
         self.url_bar.setFixedHeight(24)
-        self.url_bar.setMinimumWidth(120)
+        self.url_bar.setMinimumWidth(46)
         self.url_bar.setStyleSheet(
             f"QLineEdit{{background:#1b1a20; color:{MUTED};"
             "border:1px solid #34313d; border-radius:5px;"
-            "padding:0 7px; font-size:11px;}"
+            "padding:0 6px; font-size:11px;}"
             f"QLineEdit:focus{{color:{FG}; border-color:#5a5470;}}"
         )
         self.url_bar.returnPressed.connect(self._url_go)
         self.url_bar.editingFinished.connect(self._url_go)
-        addr_row.addWidget(self.url_bar, 1)
-        outer.addLayout(addr_row)
+        head_row.addWidget(self.url_bar, 1)
+
+        # Small on purpose: the title is a drag handle, not a heading, and it
+        # was competing with the buttons for a single row of space.
+        self._title_text = "Circle to Search"
+        title = DragBar(self._title_text)
+        title.setStyleSheet(
+            f"color:{ACCENT}; font-size:11px; font-weight:600; padding:0 4px;")
+        title.setFixedHeight(18)
+        # Small on purpose, and allowed to shrink to a bare strip: it is a
+        # drag handle first. At the minimum panel width the eight header
+        # buttons plus the URL bar leave about 60px, which is not enough to
+        # spell out the name - so the text is dropped and the empty label
+        # stays draggable. _fit_header decides when.
+        self.title = title
+        title.setMinimumWidth(16)
+        head_row.addWidget(title)
+        head_row.addWidget(self.min_btn)
+        head_row.addWidget(self.close_btn)
+        outer.addLayout(head_row)
 
         self.stack = QStackedWidget()
         self.stack.setStyleSheet(
@@ -1997,8 +1992,9 @@ class ResultsPanel(QWidget):
         self.text.setStyleSheet("font-size:13px;")
         tp.addWidget(self.text, 1)
 
-        row = QHBoxLayout()
-        row.setSpacing(6)
+        # Built here but placed in the panel's single bottom toolbar below, so
+        # they stay reachable from the Visual matches tab too - previously they
+        # lived inside this page and vanished with it.
         self.copy_btn = QPushButton("Copy text")
         self.copy_btn.clicked.connect(self.copy_text)
         self.mode_btn = QPushButton()
@@ -2071,9 +2067,7 @@ class ResultsPanel(QWidget):
                 "QPushButton:hover{background:#413d4d;}"
             )
             b.setCursor(Qt.CursorShape.PointingHandCursor)
-            row.addWidget(b)
         self._refresh_mode_btn()
-        tp.addLayout(row)
         self.stack.addWidget(text_page)
 
         # ---- tab 2: real Google Lens results (embedded, not a browser)
@@ -2109,10 +2103,66 @@ class ResultsPanel(QWidget):
         else:
             self.stack.addWidget(QLabel("PyQt6-WebEngine not installed"))
 
+        # --- the one bottom bar -----------------------------------------
+        # Tabs, the result URL and the capture controls share one row under
+        # the results. At the full panel width everything fits; narrower, the
+        # controls nearest the right edge move into a "»" menu rather than
+        # being squeezed. QToolBar was tried first and refused: it clips a
+        # button to a few pixels instead of overflowing it, which turned
+        # "Shape: lasso" into a single letter and stranded the rest.
+        self.bottom = QWidget()
+        brow = QHBoxLayout(self.bottom)
+        brow.setContentsMargins(0, 0, 0, 0)
+        brow.setSpacing(4)
+
+        tab_qss = (
+            "QPushButton{background:#26242c; color:#9a96a0;"
+            "border:none; border-radius:5px; padding:5px 11px; font-size:13px;}"
+            "QPushButton:checked{background:#3a3742; color:#e6e1e5;}"
+            "QPushButton:hover{background:#332f3c;}"
+        )
+        self.tab_text = QPushButton("Text")
+        self.tab_visual = QPushButton("Visual matches")
+        for b in (self.tab_text, self.tab_visual):
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(tab_qss)
+            b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            brow.addWidget(b)
+
+        # A stretch keeps the tabs left and the overflow button right without
+        # pinning either to an edge.
+        brow.addStretch(1)
+
+        self._controls = [self.copy_btn, self.mode_btn, self.ua_btn,
+                          self.scope_btn, self.snap_btn, self.autocopy_btn]
+        for b in self._controls:
+            b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            brow.addWidget(b)
+
+        # Only shown when something has been pushed into it.
+        self._overflow = QToolButton()
+        self._overflow.setText("\u00bb")
+        self._overflow.setToolTip("More controls")
+        self._overflow.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._overflow.setFixedWidth(28)
+        self._overflow.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._overflow.setStyleSheet(
+            "QToolButton{background:#34313d; color:#e6e1e5;"
+            "border:none; border-radius:5px; font-size:13px; padding:4px;}"
+            "QToolButton:hover{background:#413d4d;}"
+        )
+        self._overflow.setVisible(False)
+        brow.addWidget(self._overflow)
+        outer.addWidget(self.bottom)
+
         self.tab_text.setChecked(self._tab == 0)
         self.tab_visual.setChecked(self._tab == 1)
         self.tab_text.clicked.connect(lambda: self._set_tab(0))
         self.tab_visual.clicked.connect(lambda: self._set_tab(1))
+
         # Image search is the main event - open on it.
         if self._tab == 1:
             self._select_visual()
@@ -2168,6 +2218,7 @@ class ResultsPanel(QWidget):
         to get it back. Instead it just hides, and the app stays running with
         the result loaded.
         """
+        self._save_geometry()
         self.hide()
         self.minimized.emit()
         if logg:
@@ -2230,7 +2281,97 @@ class ResultsPanel(QWidget):
             grip.raise_()
         self._place_shimmer()
         self._apply_mask()
+        self._fit_bottom_bar()
+        self._fit_header()
+        # not during __init__, before the timer exists
+        timer = getattr(self, "_geom_timer", None)
+        if timer is not None:
+            timer.start()
         super().resizeEvent(e)
+
+    def _fit_header(self):
+        """Drop the title text before the header runs out of room.
+
+        The title is a label with a fixed pixel width; the eight buttons and
+        the URL bar are not. Rather than let the layout clip whichever it
+        likes, the name is hidden when there is not enough space to spell it
+        and the label is left as a small empty strip to drag the window by.
+        """
+        title = getattr(self, "title", None)
+        if title is None:
+            return
+        row = title.parentWidget()
+        if row is None or not row.layout():
+            return
+        gap = row.layout().spacing()
+        glyphs = (self.new_btn, self.back_btn, self.fwd_btn, self.home_btn,
+                  self.hist_btn, self.reload_btn, self.min_btn, self.close_btn)
+        fixed = sum(g.maximumWidth() for g in glyphs)
+        slack = (self.width() - fixed - gap * len(glyphs)
+                 - self.url_bar.minimumWidth() - title.minimumWidth())
+        needed = title.fontMetrics().horizontalAdvance(self._title_text) + 8
+        want = self._title_text if slack >= needed else ""
+        if title.text() != want:
+            title.setText(want)
+            title.setToolTip(self._title_text if not want else "")
+
+    def _fit_bottom_bar(self):
+        """Move capture controls into the "»" menu until the bar fits.
+
+        Everything is tried visible first. If the row is wider than the panel,
+        the control nearest the right edge is hidden into the overflow menu and
+        the measurement is repeated. The tabs and the URL bar are never hidden:
+        they are the two things that must stay reachable at any width.
+
+        Called from resizeEvent, so dragging a corner smaller is enough to
+        trigger it - there is no separate breakpoint to keep in step.
+        """
+        if not hasattr(self, "_controls"):
+            return                      # still in __init__
+
+        # Count everything the row holds, not just the controls: forgetting the
+        # tabs and the inter-item spacing made the first attempt look as though
+        # everything fitted, and the layout then compressed the buttons instead.
+        layout = self.bottom.layout()
+        gap = layout.spacing()
+
+        def needed():
+            items = 2                                  # the two tabs
+            total = (self.tab_text.sizeHint().width()
+                     + self.tab_visual.sizeHint().width())
+            for b in self._controls:
+                if b.isVisible():
+                    items += 1
+                    total += b.sizeHint().width()
+            if hidden:
+                items += 1
+                total += self._overflow.sizeHint().width()
+            return total + gap * max(0, items - 1)
+
+        menu = self._overflow.menu()
+        if menu is None:
+            menu = QMenu(self._overflow)
+            self._overflow.setMenu(menu)
+        menu.clear()
+
+        hidden = []
+        for b in self._controls:
+            b.setVisible(True)
+        self._overflow.setVisible(False)
+
+        avail = self.bottom.width()
+        while needed() > avail and any(b.isVisible() for b in self._controls):
+            for b in reversed(self._controls):
+                if b.isVisible():
+                    b.setVisible(False)
+                    hidden.insert(0, b)
+                    break
+
+        if hidden:
+            self._overflow.setVisible(True)
+            for b in hidden:
+                action = menu.addAction(b.text())
+                action.triggered.connect(b.click)
 
     def place_near_cursor(self):
         """Honour a saved position; only auto-place on the first ever run."""

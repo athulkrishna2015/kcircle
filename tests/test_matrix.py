@@ -20,7 +20,7 @@ import tempfile
 
 from PyQt6.QtCore import QEvent, QPointF, Qt, QUrl
 from PyQt6.QtGui import QMouseEvent
-from PyQt6.QtWidgets import QApplication, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication
 
 spec = importlib.util.spec_from_file_location("k", "kcircle.py")
 k = importlib.util.module_from_spec(spec)
@@ -676,6 +676,9 @@ def test_minimize_keeps_the_panel():
         minimize = k.ResultsPanel.minimize
         restore = k.ResultsPanel.restore
 
+        def _save_geometry(self):
+            calls.append("save_geometry")
+
         def __init__(self):
             self._closing = False
             self.visible = True
@@ -701,6 +704,8 @@ def test_minimize_keeps_the_panel():
     p = MiniPanel()
     p.minimize()
     check(p.visible is False, "minimizing hides the panel")
+    check("save_geometry" in calls,
+          "minimizing persists the size before the panel is out of sight")
     check(calls.count("hide") == 1 and "show" not in calls,
           "minimizing does not tear the panel down")
 
@@ -742,68 +747,148 @@ def test_tray_icon_fallback():
           "a themed or bundled icon was found")
 
 
-def test_header_fits_min_width():
-    print("\n== header layout ==")
-    # The header used to be one row needing ~610px against a 320px minimum,
-    # which squeezed the URL bar out of existence. It is now two rows; assert
-    # both still fit at the smallest panel the user can make.
-    from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QToolButton
-    host = QWidget()
-    row1 = QHBoxLayout()
-    row2 = QHBoxLayout()
-    for lay in (row1, row2):
-        lay.setSpacing(3)
-        host.setLayout(lay)
-
-    fixed = []
-    b = QPushButton("+")
-    b.setFixedWidth(28)
-    row1.addWidget(b)
-    fixed.append(b)
-    for glyph in ("\u2190", "\u2192", "\u2302", "\u21bb"):
-        x = QPushButton(glyph)
-        x.setFixedWidth(30)
-        row1.addWidget(x)
-        fixed.append(x)
-    hist = QToolButton()
-    hist.setFixedWidth(30)
-    row1.addWidget(hist)
-    fixed.append(hist)
-    title = QLabel("Circle to Search")
-    title.setMinimumWidth(52)
-    row1.addWidget(title, 1)                 # stretches, may shrink to 52
-    for glyph in ("\u2013", "\u00d7"):
-        x = QPushButton(glyph)
-        x.setFixedWidth(28)
-        row1.addWidget(x)
-        fixed.append(x)
-
-    url = QLineEdit()
-    url.setMinimumWidth(120)
-    row2.addWidget(url, 1)
-    url_label = url
-
-    outer = QVBoxLayout(host)
-    outer.setSpacing(4)
-    outer.addLayout(row1)
-    outer.addLayout(row2)
-
-    host.resize(k.MIN_PANEL_W, k.MIN_PANEL_H)
-    host.show()
+def _panel_at(width):
+    """A real ResultsPanel laid out at a given width."""
+    panel = k.ResultsPanel(os.path.join(tempfile.gettempdir(),
+                                        "kcircle-test-shot.png"),
+                           (0, 0, 40, 40), None)
+    panel.resize(width, 600)
+    panel.show()
     QApplication.processEvents()
+    QApplication.processEvents()
+    return panel
 
-    floor = sum(f.maximumWidth() for f in fixed) + 3 * (len(fixed) - 1)
-    check(floor + title.minimumWidth() <= k.MIN_PANEL_W,
-          f"navigation row fits the minimum width "
-          f"({floor + title.minimumWidth()} <= {k.MIN_PANEL_W})")
-    # Row 2 is the tab buttons plus the URL bar; the URL bar stretches, so
-    # what matters is that its declared minimum fits beside them.
-    row2_floor = url_label.minimumWidth()
-    check(row2_floor >= 100,
-          f"the URL bar declares a usable minimum width ({row2_floor}px)")
-    check(title.minimumWidth() > 0 and title.width() > 0,
-          "the title keeps a grabbable strip to drag the window by")
-    host.close()
+
+def test_single_header_row():
+    print("\n== one header row, everything else at the bottom ==")
+    # The header used to be two rows: navigation above, tabs and URL below.
+    # It is now a single row, with the tabs and URL moved into the bottom bar.
+    panel = _panel_at(1000)
+    outer = panel.layout()
+    rows = []
+    for i in range(outer.count()):
+        item = outer.itemAt(i)
+        if item.widget() is not None:
+            rows.append(type(item.widget()).__name__)
+    check("QWidget" in rows, "the bottom bar is a widget in the outer layout")
+    check(not any(r == "QLineEdit" for r in rows),
+          "the URL bar is not a direct child of the outer layout")
+    check(not panel.bottom.isAncestorOf(panel.url_bar),
+          "the URL bar is not in the bottom bar")
+    # It belongs beside the navigation, so it must come before the window
+    # buttons in the header row.
+    glyphs = [panel.new_btn, panel.back_btn, panel.fwd_btn, panel.home_btn,
+              panel.hist_btn, panel.reload_btn, panel.min_btn, panel.close_btn]
+    check(max(g.x() for g in glyphs[:6]) <= panel.url_bar.x(),
+          "the URL bar sits to the right of back/forward/home/history/reload")
+    check(panel.url_bar.x() <= min(g.x() for g in glyphs[6:]),
+          "the URL bar sits to the left of minimize and close")
+    for b in (panel.tab_text, panel.tab_visual):
+        check(panel.bottom.isAncestorOf(b),
+              f"the {b.text()!r} tab lives in the bottom bar")
+    for b in panel._controls:
+        check(panel.bottom.isAncestorOf(b),
+              f"the {b.text()!r} control lives in the bottom bar")
+    panel.close()
+
+
+def test_title_yields_to_the_url():
+    print("\n== the title gives way rather than clipping ==")
+    # The header holds eight fixed-width buttons, a URL bar and the title.
+    # At the minimum width there is no room for the name, so it is dropped
+    # and the label is left as an empty strip to drag the window by.
+    panel = _panel_at(1096)
+    check(panel.title.text() == "Circle to Search",
+          "the title is shown when there is room for it")
+    wide = panel.title.width()
+    panel.close()
+
+    panel = _panel_at(k.MIN_PANEL_W)
+    check(panel.title.text() == "",
+          "the title text is dropped at the minimum width")
+    check(panel.title.isVisible() and panel.title.width() > 0,
+          "an empty title strip is left behind to drag the window by")
+    check(panel.title.toolTip() == "Circle to Search",
+          "the dropped name is still available as a tooltip")
+    for g in (panel.new_btn, panel.back_btn, panel.fwd_btn, panel.home_btn,
+              panel.hist_btn, panel.reload_btn, panel.min_btn, panel.close_btn):
+        check(g.x() + g.width() <= k.MIN_PANEL_W + 1,
+              f"the {g.text() or g.toolTip()} button is not pushed off the "
+              f"panel")
+    check(panel.url_bar.width() >= panel.url_bar.minimumWidth(),
+          "the URL bar still has room to show and edit the URL")
+    panel.close()
+    check(wide > panel.title.width(), "the title is wider when it has room")
+
+
+def test_controls_survive_the_tab_switch():
+    print("\n== the controls are reachable from both tabs ==")
+    # They used to sit inside the Text page, so they disappeared the moment
+    # you looked at Visual matches - including the UA switch that decides
+    # which layout Visual matches even uses.
+    panel = _panel_at(1000)
+    page = panel.stack.widget(0)
+    check(not page.isAncestorOf(panel.copy_btn),
+          "the controls are not buried inside the Text page")
+    panel.stack.setCurrentIndex(1)
+    QApplication.processEvents()
+    check(panel.copy_btn.parent() is panel.bottom,
+          "Copy text is still parented to the panel, not the page")
+    check(panel.copy_btn.isVisibleTo(panel),
+          "Copy text stays visible on the Visual matches tab")
+    panel.close()
+
+
+def test_bottom_bar_never_clips():
+    print("\n== the bottom bar degrades instead of clipping ==")
+    # QToolBar was tried here and refused: it squeezed a button to a few
+    # pixels rather than overflowing it, turning "Shape: lasso" into one
+    # letter and stranding the rest where they could not be clicked.
+    for width in (1096, 900, 700, 560, 420, k.MIN_PANEL_W):
+        panel = _panel_at(width)
+        clipped = [b.text() for b in panel._controls
+                   if b.isVisible() and b.width() + 2 < b.sizeHint().width()]
+        check(not clipped,
+              f"no control is clipped at {width}px"
+              + (f" (clipped: {clipped})" if clipped else ""))
+        hidden = [b for b in panel._controls if not b.isVisible()]
+        menu = panel._overflow.menu()
+        labels = {a.text() for a in menu.actions()} if menu else set()
+        missing = [b.text() for b in hidden if b.text() not in labels]
+        check(not missing,
+              f"every control hidden at {width}px is in the overflow menu"
+              + (f" (missing: {missing})" if missing else ""))
+        if hidden:
+            check(panel._overflow.isVisible(),
+                  f"the overflow button appears when controls are hidden "
+                  f"at {width}px")
+        else:
+            check(not panel._overflow.isVisible(),
+                  f"the overflow button stays hidden when it is not needed "
+                  f"at {width}px")
+        check(panel.tab_text.isVisible() and panel.tab_visual.isVisible(),
+              f"the tabs stay visible at {width}px")
+        check(panel.url_bar.isVisible(),
+              f"the URL bar stays visible at {width}px")
+        panel.close()
+
+
+def test_header_fits_min_width():
+    print("\n== the header fits the minimum width ==")
+    panel = _panel_at(k.MIN_PANEL_W)
+    glyphs = [panel.new_btn, panel.back_btn, panel.fwd_btn,
+              panel.home_btn, panel.hist_btn, panel.reload_btn,
+              panel.min_btn, panel.close_btn]
+    floor = sum(g.maximumWidth() for g in glyphs) + 3 * (len(glyphs) - 1)
+    title = panel.findChildren(k.DragBar)
+    check(bool(title), "the title is still a drag handle")
+    check(floor + title[0].minimumWidth() <= k.MIN_PANEL_W,
+          f"the navigation row fits the minimum width "
+          f"({floor + title[0].minimumWidth()} <= {k.MIN_PANEL_W})")
+    for g in glyphs:
+        check(g.isVisible(), f"{g.text() or g.toolTip()} survives at the "
+                             f"minimum width")
+    panel.close()
 
 
 def test_ua():
@@ -1199,6 +1284,10 @@ def main():
     test_switch_modifier_mid_drag()
     test_minimize_keeps_the_panel()
     test_launching_always_captures()
+    test_single_header_row()
+    test_title_yields_to_the_url()
+    test_controls_survive_the_tab_switch()
+    test_bottom_bar_never_clips()
     test_header_fits_min_width()
     test_page_is_left_alone()
     test_no_zoom_or_reflow()

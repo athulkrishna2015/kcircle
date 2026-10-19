@@ -37,22 +37,49 @@ jobs:
         run: |
           set -euo pipefail
           ver="${GITHUB_REF_NAME#v}"
-          pip install pyinstaller
-          pyinstaller --onefile --name kcircle kcircle.py || true
+          out="kcircle-${ver}-x86_64.AppImage"
+
+          # The tool is downloaded into its own directory so the artifact glob
+          # below cannot pick it up. It was previously uploaded as a release
+          # asset - a 8.6 MB AppImageKit download, while the actual AppImage
+          # was never produced because its failure was swallowed by "|| true".
+          mkdir -p tools && cd tools
           wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
-          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/scalable/apps
-          cp kcircle AppDir/usr/bin/ 2>/dev/null || true
+          cd ..
+
+          # A PyQt6 app needs its interpreter and wheels inside the image.
+          # A launcher that called the system python3 produced an AppImage
+          # which could not import PyQt6 on any machine.
+          export UV_LINK_MODE=copy
+          uv venv "$PWD/AppDir/venv" --python 3.12
+          uv pip install --python "$PWD/AppDir/venv/bin/python" \
+            -r requirements.txt
+
+          mkdir -p AppDir/usr/share/applications \
+                   AppDir/usr/share/icons/hicolor/scalable/apps
           cp kcircle.py AppDir/usr/bin/kcircle.py
           cp kcircle.desktop AppDir/usr/share/applications/
           cp kcircle.svg AppDir/usr/share/icons/hicolor/scalable/apps/
-          printf '%s\n' '#!/bin/bash' 'exec python3 /usr/bin/kcircle.py "$@"' > AppDir/AppRun
+
+          cat > AppDir/AppRun <<'RUNNER'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "$0")")"
+          if [[ -z "${QT_QPA_PLATFORM:-}" && -n "${WAYLAND_DISPLAY:-}" ]]; then
+            export QT_QPA_PLATFORM=wayland
+          fi
+          exec "$HERE/venv/bin/python" "$HERE/usr/bin/kcircle.py" "$@"
+          RUNNER
           chmod +x AppDir/AppRun
-          ./appimagetool-x86_64.AppImage AppDir "kcircle-${ver}-x86_64.AppImage" || true
+
+          ./tools/appimagetool-x86_64.AppImage AppDir "$out"
+          test -s "$out" || { echo "::error::AppImage was not produced"; exit 1; }
+          ls -la "$out"
       - uses: actions/upload-artifact@v4
         with:
           name: kcircle-appimage
-          path: '*.AppImage'
+          # kcircle-*.AppImage only - never the AppImageKit build tool.
+          path: 'kcircle-*.AppImage'
 
   release:
     needs: [build-tarball, build-appimage]
@@ -65,8 +92,11 @@ jobs:
           merge-multiple: true
       - name: SHA256SUMS
         run: |
+          set -euo pipefail
           cd artifacts
-          sha256sum * > SHA256SUMS.txt 2>/dev/null || true
+          # Exclude the checksum file itself, or sha256sum races its own output.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\n' \
+            | sort | xargs sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:

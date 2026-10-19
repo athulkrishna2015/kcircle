@@ -8,6 +8,10 @@ dependencies = [
     "PyQt6",
     "PyQt6-WebEngine",
     "chrome-lens-py",
+    # Imported directly for capture, masking, edge detection and cropping.
+    # It resolves today only because chrome-lens-py happens to depend on it;
+    # relying on that transitive edge would break the core path silently.
+    "Pillow",
 ]
 
 [project.scripts]

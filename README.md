@@ -190,15 +190,33 @@ Every control writes itself to `settings.json`, so you set things once.
 | `⌂` | reload the Lens result this panel came from |
 | `⋮` | history — every URL visited in this panel, newest first |
 | `⟳` | reload the current page |
-| `Text` / `Visual matches` | switch between native OCR results and embedded Google results |
 | results URL | the current Lens URL — copy it, edit it, open it elsewhere |
+| `Circle to Search` | drag the window by it; the text is dropped when the row is tight |
+| `–` / `×` | minimize to the tray / close and quit |
+
+Those eight are the header, in a single row. Everything else lives in one bar
+under the results, and stays reachable from both tabs:
+
+| Button | What it does |
+| --- | --- |
+| `Text` / `Visual matches` | switch between native OCR results and embedded Google results |
 | `Copy text` | decoded codes first, then any text, onto the clipboard |
 | `◎ tap` | tap-to-search and scribble snapping on/off |
 | `⧉` | auto-copy results as soon as they arrive |
 | `Shape:` | the shape used when no modifier is held |
 | `▣ select` | what gets captured next: region, active window or whole screen |
 | `UA:` | Google's mobile or desktop presentation |
-| `–` / `×` | minimize to the tray / close and quit |
+| `»` | controls that did not fit — only appears when some are hidden |
+
+The `»` menu exists because the bottom bar genuinely does not fit at the
+minimum panel width. Rather than squeeze a button — which clipped `Shape:
+lasso` down to a single letter and stranded the ones behind it — the controls
+nearest the right edge move into `»`, recomputed on every resize. The tabs are
+never hidden.
+
+The panel remembers its size and position across runs. It is written on a
+400 ms debounce after any resize rather than only when the panel closes, so a
+resize survives a crash or a kill.
 
 Right-clicking the results gives the usual browser menu — Back, Forward,
 Reload, Copy, Copy link address, Save page, and open/save link in a new tab or
@@ -477,6 +495,10 @@ there is ~0.17 s against ~0.15 s on the native filesystem, which is small
 enough not to matter — but the code itself is worth keeping on Linux-native
 storage.
 
+The panel also has to be found on `PATH`-independent terms: bind the shortcut
+to the same absolute path, or `git pull` will update the code but not whatever
+the shortcut points at.
+
 The `X-KDE-DBUS-Restricted-Interfaces` line is only needed if you later switch
 capture to KWin's own `org.kde.KWin.ScreenShot2` API; the default `spectacle`
 path does not require it.
@@ -488,7 +510,7 @@ hand and see that icon, add the line.
 
 ## Tests
 
-A local matrix of 153 checks covers every scope, shape and user-agent
+A local matrix of 251 checks covers every scope, shape and user-agent
 combination, and asserts the invariants that have actually broken:
 
 - a selection never uploads the whole screenshot, and the visual tab never
@@ -514,6 +536,12 @@ Headless runs cannot exercise compositor, mouse or tray behaviour. Those were
 verified against a real Wayland session — which is how the
 `QSystemTrayIcon.hideMessage` crash was caught, a bug 153 passing checks had
 missed. Changes in those areas need a real desktop to confirm.
+
+Layout is the other blind spot: an off-screen panel will happily lay out at a
+width nobody can drag to, and a widget squeezed below its own minimum looks
+merely small rather than broken. The matrix therefore asserts that no control
+in the bottom bar is ever narrower than it asks for, at every width the corner
+grip allows.
 
 The same blind spot applies to QtWebEngine API calls: an off-screen suite cannot
 tell you that `WebAction.SaveLinkToDisk` does not exist until a user
