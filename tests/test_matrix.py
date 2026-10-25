@@ -756,6 +756,20 @@ def test_launcher_fast_relay():
           "launcher still falls back to the resident app startup")
 
 
+def test_capture_is_backgrounded():
+    print("\n== scan surface appears before capture completes ==")
+    src = open("kcircle.py").read()
+    begin = src.index("def begin_capture():")
+    capture = src.index("capture_worker = CaptureWorker", begin)
+    show = src.index("ov.show()", begin)
+    check(show < capture,
+          "the scan overlay is shown before the screenshot worker starts")
+    check("class CaptureWorker" in src,
+          "screen capture runs on a worker thread")
+    check("ov.set_shot(shot_path)" in src,
+          "the captured frame is installed after the overlay appears")
+
+
 def test_tray_icon_fallback():
     print("\n== tray icon ==")
     # A minimized panel has nowhere else to go, so the tray is the answer. It
@@ -1393,6 +1407,7 @@ def main():
     test_minimize_keeps_the_panel()
     test_launching_always_captures()
     test_launcher_fast_relay()
+    test_capture_is_backgrounded()
     test_tray_click_restores_session()
     test_escape_cancels_without_quitting()
     test_super_copies_without_opening_the_panel()

@@ -848,6 +848,23 @@ class ObjectWorker(QThread):
         self.found.emit(boxes)
 
 
+class CaptureWorker(QThread):
+    """Capture off the GUI thread so the scan surface can appear immediately."""
+
+    captured = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, scope):
+        super().__init__()
+        self.scope = scope
+
+    def run(self):
+        try:
+            self.captured.emit(capture(self.scope))
+        except Exception as exc:                    # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
 # Threads are deliberately not parented to the overlay. A QThread owned by a
 # widget dies with it, and destroying a running QThread aborts the process; the
 # overlay can close long before a scan finishes. Holding them here keeps the
@@ -867,7 +884,7 @@ class SelectionOverlay(QWidget):
     cancelled = pyqtSignal()
     missed = pyqtSignal()         # a tap that matched no object
 
-    def __init__(self, shot_path: str):
+    def __init__(self, shot_path: str | None = None):
         super().__init__()
         # BypassWindowManagerHint by default. KWin keeps panels and docks on
         # their own top layer, which a plain always-on-top window cannot rise
@@ -899,7 +916,8 @@ class SelectionOverlay(QWidget):
         self._unblank.setSingleShot(True)
         self._unblank.timeout.connect(self._show_pointer)
 
-        self.shot = QPixmap(shot_path)
+        self.shot_path = shot_path
+        self.shot = QPixmap(shot_path) if shot_path else QPixmap()
         self.origin = None
         self.current = None
         self.path = []            # lasso points, in widget coords
@@ -917,20 +935,15 @@ class SelectionOverlay(QWidget):
         self.snap = bool(settings.get("snap", True))
         self._press_t = None
         self._show_objects = bool(settings.get("hint", True))
-        if os.environ.get("KCIRCLE_NO_SNAP") != "1":
-            self._scanner = ObjectWorker(shot_path)
-            _SCANNERS.add(self._scanner)
-            self._scanner.finished.connect(
-                lambda w=self._scanner: _SCANNERS.discard(w))
-            self._scanner.found.connect(self._on_objects)
-            self._scanner.start()
+        self._scanner = None
+        if shot_path:
+            self._start_object_scan(shot_path)
 
         # Cover the whole capture, not just the primary output. spectacle grabs the
         # entire virtual desktop, so an overlay sized to a single screen would
         # leave the rest of the capture unreachable and mis-map every
         # coordinate on a second monitor.
         desktop = _virtual_desktop()
-        ratio = _capture_ratio(shot_path, desktop)
         self.setGeometry(desktop)
 
         # Pinning the size is what actually makes the overlay cover the screen.
@@ -941,7 +954,8 @@ class SelectionOverlay(QWidget):
         if os.environ.get("KCIRCLE_NO_SIZE_LOCK") != "1":
             self.setFixedSize(desktop.width(), desktop.height())
 
-        if logg:
+        if logg and shot_path:
+            ratio = _capture_ratio(shot_path, desktop)
             logg.info("overlay %dx%d logical, capture ratio %.3f "
                       "(capture %dx%d device px)", desktop.width(),
                       desktop.height(), ratio,
@@ -976,6 +990,22 @@ class SelectionOverlay(QWidget):
         self._glow_timer = QTimer(self)
         self._glow_timer.timeout.connect(self._glow_tick)
         self._hint = hint
+
+    def set_shot(self, shot_path: str):
+        """Install the frozen frame after the already-visible overlay opens."""
+        self.shot_path = shot_path
+        self.shot = QPixmap(shot_path)
+        self._start_object_scan(shot_path)
+        self.update()
+
+    def _start_object_scan(self, shot_path: str):
+        if os.environ.get("KCIRCLE_NO_SNAP") != "1":
+            self._scanner = ObjectWorker(shot_path)
+            _SCANNERS.add(self._scanner)
+            self._scanner.finished.connect(
+                lambda w=self._scanner: _SCANNERS.discard(w))
+            self._scanner.found.connect(self._on_objects)
+            self._scanner.start()
 
     def _show_pointer(self):
         self.setCursor(Qt.CursorShape.CrossCursor)
@@ -2992,7 +3022,7 @@ def main():
             logg.info("no system tray: a minimized panel cannot be restored")
 
     def begin_capture():
-        """Hide the panel, freeze the screen, wait for a selection."""
+        """Show the scan surface immediately, then capture it in background."""
         if state["overlay"] is not None:
             # An external relaunch always means a new search. Replace an
             # in-progress selection rather than silently reusing it.
@@ -3007,15 +3037,27 @@ def main():
         scope = load_settings().get("scope", "select")
         if scope not in CAPTURE_SCOPES:
             scope = "select"
-        try:
-            shot = capture(scope)
-            logg.info("captured scope=%s -> %s", scope, shot)
-        except Exception as exc:                     # noqa: BLE001
-            logg.error("capture failed: %s", exc)
+        ov = SelectionOverlay()
+        state["overlay"] = ov
+        shot = None
+
+        def on_capture_failed(message):
+            state["overlay"] = None
+            ov.close()
+            logg.error("capture failed: %s", message)
             if QSystemTrayIcon.isSystemTrayAvailable():
                 tray.showMessage("Circle to Search", "Capture failed; still running in the tray",
                                  QSystemTrayIcon.MessageIcon.Warning, 3000)
-            return
+
+        def on_captured(shot_path):
+            nonlocal shot
+            shot = shot_path
+            logg.info("captured scope=%s -> %s", scope, shot_path)
+            ov.set_shot(shot_path)
+            if scope != "select":
+                state["overlay"] = None
+                ov.close()
+                show_panel(shot_path, (0.0, 0.0, 1.0, 1.0), None)
 
         def show_panel(shot_path, region, poly):
             # Keep the scan/copy path fast. WebEngine's safety probe can spawn
@@ -3045,16 +3087,9 @@ def main():
             state["panel"] = new
             new.show_results()
 
-        if scope != "select":
-            # the capture IS the selection here, so skip the overlay entirely
-            logg.info("scope=%s: searching the capture directly", scope)
-            show_panel(shot, (0.0, 0.0, 1.0, 1.0), None)
-            return
-
-        ov = SelectionOverlay(shot)
-        state["overlay"] = ov
-
         def on_pick(selection):
+            if shot is None:
+                return
             state["overlay"] = None
             ov.close()
             region, poly = selection
@@ -3068,6 +3103,8 @@ def main():
             Deliberately independent of the auto-copy setting - holding Super
             is an explicit request to copy, and a panel would defeat the point.
             """
+            if shot is None:
+                return
             state["overlay"] = None
             ov.close()
             region, poly = selection
@@ -3151,6 +3188,13 @@ def main():
             ov.update()
         QTimer.singleShot(0, _focus)
         QTimer.singleShot(180, _focus)
+
+        capture_worker = CaptureWorker(scope)
+        capture_worker.captured.connect(on_captured)
+        capture_worker.failed.connect(on_capture_failed)
+        _SCANNERS.add(capture_worker)
+        capture_worker.finished.connect(lambda: _SCANNERS.discard(capture_worker))
+        capture_worker.start()
 
     def _poll_relaunch():
         if not _RELAUNCH_REQUESTS.empty():
