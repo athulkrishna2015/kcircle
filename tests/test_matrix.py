@@ -739,6 +739,10 @@ def test_launching_always_captures():
           "a relaunch replaces an active selection instead of reusing it")
     check(src.index('if _shm.attach():') < src.index('webengine_is_healthy()'),
           "relaunch IPC is checked before the slow WebEngine probe")
+    panel_start = src.index('def show_panel(')
+    panel_end = src.index('old = state["panel"]', panel_start)
+    check('webengine_is_healthy()' in src[panel_start:panel_end],
+          "WebEngine probing is deferred until a results panel is needed")
 
 
 def test_launcher_fast_relay():

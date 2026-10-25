@@ -2937,12 +2937,6 @@ def main():
     _shm.create(1)
     _start_relay_socket()
 
-    if HAVE_WEBENGINE and not webengine_is_healthy():
-        logg.warning("QtWebEngine is installed but crashes on this system "
-                     "(likely a PyQt6/Qt patch mismatch). Disabling the "
-                     "Visual matches tab; OCR and translation still work.")
-        HAVE_WEBENGINE = False
-
     logg.info("kcircle start (translate=%s, webengine=%s, settings=%s)",
               translate_to or "off", HAVE_WEBENGINE, load_settings())
 
@@ -3024,6 +3018,15 @@ def main():
             return
 
         def show_panel(shot_path, region, poly):
+            # Keep the scan/copy path fast. WebEngine's safety probe can spawn
+            # Chromium and take seconds, but copy-only never needs a panel or
+            # browser, so defer it until a result panel is actually required.
+            global HAVE_WEBENGINE
+            if HAVE_WEBENGINE and not webengine_is_healthy():
+                logg.warning("QtWebEngine is installed but crashes on this system "
+                             "(likely a PyQt6/Qt patch mismatch). Disabling the "
+                             "Visual matches tab; OCR and translation still work.")
+                HAVE_WEBENGINE = False
             old = state["panel"]
             if old is not None:
                 old._destroying = True
