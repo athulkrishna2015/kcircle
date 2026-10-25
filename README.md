@@ -229,7 +229,7 @@ Every control writes itself to `settings.json`, so you set things once.
 | `⟳` | reload the current page |
 | results URL | the current Lens URL — copy it, edit it, open it elsewhere |
 | `Circle to Search` | drag the window by it; the text is dropped when the row is tight |
-| `–` / `×` | minimize to the tray / close and quit |
+| `–` / `×` | minimize to the tray (app keeps running in background) / quit from tray |
 
 Those eight are the header, in a single row. Everything else lives in one bar
 under the results, and stays reachable from both tabs:
