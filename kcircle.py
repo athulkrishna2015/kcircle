@@ -1290,6 +1290,9 @@ class SelectionOverlay(QWidget):
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
             self.cancelled.emit()
+            e.accept()
+            return
+        super().keyPressEvent(e)
 
     def closeEvent(self, e):
         # The detector thread is parented to this widget, so closing while it
@@ -1843,7 +1846,7 @@ class ResizeGrip(QWidget):
 
 
 class ResultsPanel(QWidget):
-    """Small always-on-top card. Stays out of the way, closes on Esc."""
+    """Small always-on-top card that minimizes to the tray instead of closing."""
 
     finished = pyqtSignal()
     newCapture = pyqtSignal()
@@ -1904,8 +1907,8 @@ class ResultsPanel(QWidget):
         self.min_btn.setToolTip("Minimize to the tray")
         self.min_btn.clicked.connect(self.minimize)
         self.close_btn = QPushButton("\u00d7")
-        self.close_btn.setToolTip("Close (Esc)")
-        self.close_btn.clicked.connect(self.close)
+        self.close_btn.setToolTip("Minimize to the tray (Esc)")
+        self.close_btn.clicked.connect(self.minimize)
         for b in (self.new_btn, self.min_btn, self.close_btn):
             b.setFixedWidth(28)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2201,7 +2204,7 @@ class ResultsPanel(QWidget):
         else:
             self.stack.setCurrentIndex(0)
 
-        self.footer = QLabel("Esc close · drag title · corner resize")
+        self.footer = QLabel("Esc minimize · drag title · corner resize")
         self.footer.setStyleSheet(f"color:{MUTED}; font-size:11px; padding:0 2px;")
         self.footer.setFixedHeight(16)
         outer.addWidget(self.footer)
@@ -2218,10 +2221,10 @@ class ResultsPanel(QWidget):
 
         self.place_near_cursor()
 
-        # Esc closes the panel even if the compositor never gave us focus
+        # Esc dismisses the panel without ending the resident app.
         self._esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
         self._esc.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        self._esc.activated.connect(self.close)
+        self._esc.activated.connect(self.minimize)
 
     def show_results(self):
         """Kick off the Lens request and make the panel visible."""
@@ -2807,9 +2810,17 @@ class ResultsPanel(QWidget):
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
-            self.close()
+            self.minimize()
 
     def closeEvent(self, e):
+        # The panel is never an exit control. Window-manager close requests
+        # (including any compositor-provided close gesture) go to the tray.
+        # Internal replacement during an explicit new search is the one
+        # operation allowed to destroy this widget.
+        if not getattr(self, "_destroying", False):
+            e.ignore()
+            self.minimize()
+            return
         self._closing = True
         self.shimmer.stop()
         # The Lens request may still be in flight. quit() is a no-op here (the
@@ -2861,14 +2872,14 @@ def main():
     logg.info("kcircle start (translate=%s, webengine=%s, settings=%s)",
               translate_to or "off", HAVE_WEBENGINE, load_settings())
 
-    # Single-instance: if another kcircle is already running, ask it to come
-    # to the foreground and exit immediately instead of starting a second copy.
+    # Single-instance: if another kcircle is already running, restore its
+    # existing session and exit immediately instead of starting a second copy.
     _shm = QSharedMemory("kcircle-single-instance")
     if _shm.attach():
         _sock = QLocalSocket()
         _sock.connectToServer("kcircle-ipc")
         if _sock.waitForConnected(500):
-            _sock.write(b"focus")
+            _sock.write(b"restore")
             _sock.flush()
             _sock.waitForBytesWritten(500)
         _sock.disconnectFromServer()
@@ -2881,14 +2892,12 @@ def main():
     state = {"panel": None, "overlay": None}
 
     def restore_panel(*_):
-        """Bring the panel back after it was minimized.
-
-        Only reachable from the tray, on purpose. This app's primary action is
-        "capture the screen", so launching it must always start a capture -
-        a previous version made a second launch mean "restore" instead, which
-        quietly turned the main gesture into a no-op whenever an instance was
-        already alive. The tray is the only thing that should restore.
-        """
+        """Restore the one resident session without starting another capture."""
+        overlay = state["overlay"]
+        if overlay is not None:
+            overlay.raise_()
+            overlay.activateWindow()
+            return
         panel = state["panel"]
         if panel is None or panel._closing:
             return
@@ -2912,18 +2921,12 @@ def main():
     tray_menu.addSeparator()
     tray_menu.addAction("Quit", app.quit)
     tray.setContextMenu(tray_menu)
-    # Left click is the one click that should do something useful: start a new
-    # search. It used to only restore a minimized panel, which meant the tray
-    # was a passive "get my window back" button and nothing more.
-    #
-    # Right click is untouched - Qt raises the menu above on its own, so
-    # restoring a minimized panel is still one right click away. That matters:
-    # with left click taken over, the menu is now the only route back to a
-    # panel the user did not mean to replace.
+    # Tray clicks restore the resident session. New searches are explicit via
+    # the context menu, so relaunches and clicks never create sessions.
     def on_tray_activated(reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger,
                       QSystemTrayIcon.ActivationReason.DoubleClick):
-            begin_capture()
+            restore_panel()
 
     tray.activated.connect(on_tray_activated)
     if QSystemTrayIcon.isSystemTrayAvailable():
@@ -2952,16 +2955,18 @@ def main():
             logg.info("captured scope=%s -> %s", scope, shot)
         except Exception as exc:                     # noqa: BLE001
             logg.error("capture failed: %s", exc)
-            QTimer.singleShot(200, app.quit)
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                tray.showMessage("Circle to Search", "Capture failed; still running in the tray",
+                                 QSystemTrayIcon.MessageIcon.Warning, 3000)
             return
 
         def show_panel(shot_path, region, poly):
             old = state["panel"]
             if old is not None:
+                old._destroying = True
                 old.deleteLater()
             new = ResultsPanel(shot_path, region, translate_to, poly)
             new.newCapture.connect(begin_capture)
-            new.finished.connect(app.quit)
 
             def on_minimized():
                 # Say where it went. A frameless always-on-top panel has no
@@ -3044,14 +3049,23 @@ def main():
                 logg.info("copy-only: %s - %s", title, body)
 
         def on_cancel():
+            # Escape can reach both the application shortcut and the overlay's
+            # key handler. Make cancellation idempotent so the second delivery
+            # cannot tear down the resident tray session.
+            if state["overlay"] is not ov:
+                return
             state["overlay"] = None
             logg.info("cancelled by user")
             ov.close()
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                tray.show()
             if state["panel"] is not None:
                 state["panel"].show()
                 state["panel"].raise_()
             else:
-                app.quit()
+                # Keep the process and tray resident even if the first capture
+                # is cancelled before a results panel exists.
+                return
 
         ov.picked.connect(on_pick)
         ov.copyOnly.connect(on_copy_only)
@@ -3072,7 +3086,7 @@ def main():
         QTimer.singleShot(0, _focus)
         QTimer.singleShot(180, _focus)
 
-    # IPC server: a relaunch asks the running instance to start a new scan.
+    # IPC server: a relaunch restores the running instance.
     _srv = QLocalServer()
     _srv.removeServer("kcircle-ipc")
     _srv.listen("kcircle-ipc")
@@ -3082,7 +3096,7 @@ def main():
             return
         conn.waitForReadyRead(200)
         conn.readAll()
-        QTimer.singleShot(0, begin_capture)
+        QTimer.singleShot(0, restore_panel)
         conn.disconnectFromServer()
     _srv.newConnection.connect(_on_ipc)
 

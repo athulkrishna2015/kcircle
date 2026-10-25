@@ -725,15 +725,15 @@ def test_minimize_keeps_the_panel():
 
 
 def test_launching_always_captures():
-    print("\n== launching always captures ==")
-    # Regression guard. A previous version made a second launch mean "restore
-    # the minimized panel" and exit, which silently turned the app's primary
-    # gesture into a no-op whenever an instance was already alive. Nothing may
-    # reintroduce a code path that can make a launch do nothing.
+    print("\n== launching restores the resident session ==")
     src = open("kcircle.py").read()
     for gone in ("_restore_running_instance", "SIGUSR1", "_claim_instance",
                  "_running_instance"):
         check(gone not in src, f"the {gone} no-op path is gone")
+    check('_sock.write(b"restore")' in src,
+          "a second launch asks the resident instance to restore")
+    check("QTimer.singleShot(0, restore_panel)" in src,
+          "IPC restores instead of creating a second session")
 
 
 def test_tray_icon_fallback():
@@ -942,22 +942,16 @@ def test_copy_only_never_opens_a_panel():
           "copy-only does not consult the auto-copy setting")
 
 
-def test_tray_left_click_searches():
-    print("\n== the tray's left click starts a search ==")
-    # It used to only restore a minimized panel, which made the tray a passive
-    # "get my window back" button. Right click must still raise the menu, and
-    # the menu must still be the way back to a panel the user did not mean to
-    # replace - otherwise minimizing has become a one-way door.
+def test_tray_click_restores_session():
+    print("\n== the tray restores the resident session ==")
     # Read raw source: _code_only joins tokens with spaces, which would break
     # every dotted name this test looks for.
     raw = open("kcircle.py").read()
     tray = raw[raw.index("tray = QSystemTrayIcon"):raw.index("def begin_capture")]
     handler = raw[raw.index("def on_tray_activated"):
                   raw.index("tray.activated.connect")]
-    check("begin_capture" in handler,
-          "a left click starts a new search")
-    check("restore_panel" not in handler,
-          "a left click no longer just restores the panel")
+    check("restore_panel" in handler,
+          "a tray click restores the resident session")
     check("ActivationReason.Trigger" in handler
           and "ActivationReason.DoubleClick" in handler,
           "both single and double click are treated the same")
@@ -966,9 +960,23 @@ def test_tray_left_click_searches():
     check('addAction("Restore panel", restore_panel)' in tray,
           "the menu still restores a minimized panel")
     check('addAction("New search"' in tray,
-          "the menu can also start a new search")
-    check("click to search" in raw,
-          "the tooltip says what a left click does")
+          "the menu can explicitly start a new search")
+    check("right-click for more" in raw,
+          "the tooltip points to the context menu")
+
+
+def test_escape_cancels_without_quitting():
+    print("\n== Escape cancels a search without quitting ==")
+    raw = open("kcircle.py").read()
+    start = raw.index("def on_cancel():")
+    end = raw.index("ov.picked.connect", start)
+    handler = raw[start:end]
+    check('if state["overlay"] is not ov' in handler,
+          "repeated Escape delivery is ignored")
+    check("tray.show()" in handler,
+          "cancellation keeps the tray icon visible")
+    check("app.quit()" not in handler,
+          "cancelling a search never quits the resident app")
 
 
 def test_ua():
@@ -1364,7 +1372,8 @@ def main():
     test_switch_modifier_mid_drag()
     test_minimize_keeps_the_panel()
     test_launching_always_captures()
-    test_tray_left_click_searches()
+    test_tray_click_restores_session()
+    test_escape_cancels_without_quitting()
     test_super_copies_without_opening_the_panel()
     test_copy_only_never_opens_a_panel()
     test_single_header_row()

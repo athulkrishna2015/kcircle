@@ -103,12 +103,13 @@ as a browser would render it.
   taskbar entry, so without that it would simply vanish. Click the tray icon
   to bring it back.
 
-  Launching kcircle always starts a new capture, never a restore — this app
-  exists to capture, so the shortcut must never quietly do nothing.
+  Launching kcircle while it is already running restores the existing session
+  from the tray instead of starting a second session. The process stays resident
+  for fast subsequent searches.
 
   On a desktop with **no system tray**, minimize still works but there is
   nowhere to retrieve the panel from. `KCIRCLE_LOG=debug` says so at startup;
-  otherwise use `+` for a new capture or close the window outright.
+  The only way to end the resident process is **Quit** in the tray menu.
 - **User-agent switch** between Google's mobile and desktop presentations,
   remembered between runs.
 - **Last tab** — Text or Visual matches, reopened on the next launch.
@@ -411,13 +412,13 @@ uv pip install --upgrade -r requirements.txt
 2. Draw around what you want — box, ellipse, square or lasso. Right-click or
    `Esc` cancels.
 3. Results appear in the panel, image search already open. Drag the title to
-   move, grab the bottom-right corner to resize, `Esc` to close.
+   move, grab the bottom-right corner to resize, `Esc` to minimize to the tray.
 4. Press `+` for another capture — the panel hides while you select.
 
 The header carries `+`, the two tab buttons, a **URL bar** showing the current
 Lens result (selectable, copyable, and editable — type a URL and press Enter to
 navigate), and `×`. The buttons along the bottom cycle **Shape**, **UA** and
-**Scope**, and copy the OCR text to the clipboard. `Esc` closes.
+**Scope**, and copy the OCR text to the clipboard. `Esc` minimizes to the tray.
 
 Bind a shortcut in *System Settings → Shortcuts → Custom Shortcuts*:
 
