@@ -741,6 +741,17 @@ def test_launching_always_captures():
           "relaunch IPC is checked before the slow WebEngine probe")
 
 
+def test_launcher_fast_relay():
+    print("\n== launcher relays without importing Qt ==")
+    launcher = open("kcircle").read()
+    check("kcircle-${UID}.sock" in launcher,
+          "launcher uses a per-user resident relay socket")
+    check('s.sendall(b"new-search")' in launcher,
+          "launcher sends the new-search request directly")
+    check("exec \"$DIR/.venv/bin/python\"" in launcher,
+          "launcher still falls back to the resident app startup")
+
+
 def test_tray_icon_fallback():
     print("\n== tray icon ==")
     # A minimized panel has nowhere else to go, so the tray is the answer. It
@@ -1377,6 +1388,7 @@ def main():
     test_switch_modifier_mid_drag()
     test_minimize_keeps_the_panel()
     test_launching_always_captures()
+    test_launcher_fast_relay()
     test_tray_click_restores_session()
     test_escape_cancels_without_quitting()
     test_super_copies_without_opening_the_panel()

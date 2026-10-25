@@ -15,10 +15,13 @@ import asyncio
 import atexit
 import itertools
 import os
+import queue
+import socket
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QSharedMemory, QThread, QTimer, QUrl, pyqtSignal
@@ -80,6 +83,51 @@ MUTED = "#9a96a0"
 _tmpdir = None
 _capture_seq = itertools.count(1)
 _crop_seq = itertools.count(1)
+_RELAUNCH_REQUESTS = queue.SimpleQueue()
+_RELAY_SOCKET = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(),
+    f"kcircle-{os.getuid()}.sock",
+)
+
+
+def _start_relay_socket() -> None:
+    """Accept fast relaunch requests without importing Qt in the client."""
+    try:
+        os.unlink(_RELAY_SOCKET)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return
+
+    def serve():
+        try:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(_RELAY_SOCKET)
+            os.chmod(_RELAY_SOCKET, 0o600)
+            server.listen(8)
+        except OSError:
+            return
+        while True:
+            try:
+                conn, _ = server.accept()
+                conn.close()
+                _RELAUNCH_REQUESTS.put(True)
+            except OSError:
+                return
+
+    threading.Thread(target=serve, name="kcircle-relay", daemon=True).start()
+
+
+def _stop_relay_socket() -> None:
+    try:
+        os.unlink(_RELAY_SOCKET)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+atexit.register(_stop_relay_socket)
 
 
 def _config_dir() -> str:
@@ -2887,6 +2935,7 @@ def main():
         _shm.detach()
         sys.exit(0)
     _shm.create(1)
+    _start_relay_socket()
 
     if HAVE_WEBENGINE and not webengine_is_healthy():
         logg.warning("QtWebEngine is installed but crashes on this system "
@@ -3099,6 +3148,16 @@ def main():
             ov.update()
         QTimer.singleShot(0, _focus)
         QTimer.singleShot(180, _focus)
+
+    def _poll_relaunch():
+        if not _RELAUNCH_REQUESTS.empty():
+            _RELAUNCH_REQUESTS.get_nowait()
+            begin_capture()
+
+    relay_timer = QTimer()
+    relay_timer.setInterval(20)
+    relay_timer.timeout.connect(_poll_relaunch)
+    relay_timer.start()
 
     # IPC server: every relaunch starts a new search in the running instance.
     _srv = QLocalServer()

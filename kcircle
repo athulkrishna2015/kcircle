@@ -2,6 +2,17 @@
 # kcircle launcher
 set -euo pipefail
 DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+RELAY="${XDG_RUNTIME_DIR:-/tmp}/kcircle-${UID}.sock"
+
+# A shortcut launch should not import Qt just to discover that the resident
+# process already exists. The resident app listens on this tiny stdlib socket;
+# a successful handoff returns immediately and keeps startup effectively instant.
+if [[ -S "$RELAY" ]]; then
+    if "$DIR/.venv/bin/python" -c 'import socket,sys; p=sys.argv[1]; s=socket.socket(socket.AF_UNIX); s.settimeout(.35); s.connect(p); s.sendall(b"new-search"); s.close()' "$RELAY" 2>/dev/null; then
+        exit 0
+    fi
+    rm -f "$RELAY"
+fi
 
 # Prefer the native Wayland platform when we are in a Wayland session.
 #
