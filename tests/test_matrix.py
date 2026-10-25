@@ -725,15 +725,20 @@ def test_minimize_keeps_the_panel():
 
 
 def test_launching_always_captures():
-    print("\n== launching restores the resident session ==")
+    print("\n== every launch starts a search in the resident session ==")
     src = open("kcircle.py").read()
     for gone in ("_restore_running_instance", "SIGUSR1", "_claim_instance",
                  "_running_instance"):
         check(gone not in src, f"the {gone} no-op path is gone")
-    check('_sock.write(b"restore")' in src,
-          "a second launch asks the resident instance to restore")
-    check("QTimer.singleShot(0, restore_panel)" in src,
-          "IPC restores instead of creating a second session")
+    check('_sock.write(b"new-search")' in src,
+          "a second launch asks the resident instance to start a new search")
+    check("QTimer.singleShot(0, begin_capture)" in src,
+          "IPC starts a new search in the resident process")
+    check('old_overlay = state["overlay"]' in src
+          and 'old_overlay.close()' in src,
+          "a relaunch replaces an active selection instead of reusing it")
+    check(src.index('if _shm.attach():') < src.index('webengine_is_healthy()'),
+          "relaunch IPC is checked before the slow WebEngine probe")
 
 
 def test_tray_icon_fallback():
@@ -950,8 +955,8 @@ def test_tray_click_restores_session():
     tray = raw[raw.index("tray = QSystemTrayIcon"):raw.index("def begin_capture")]
     handler = raw[raw.index("def on_tray_activated"):
                   raw.index("tray.activated.connect")]
-    check("restore_panel" in handler,
-          "a tray click restores the resident session")
+    check("begin_capture" in handler,
+          "a tray click starts a new search")
     check("ActivationReason.Trigger" in handler
           and "ActivationReason.DoubleClick" in handler,
           "both single and double click are treated the same")

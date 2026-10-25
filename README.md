@@ -103,9 +103,10 @@ as a browser would render it.
   taskbar entry, so without that it would simply vanish. Click the tray icon
   to bring it back.
 
-  Launching kcircle while it is already running restores the existing session
-  from the tray instead of starting a second session. The process stays resident
-  for fast subsequent searches.
+Launching kcircle while it is already running starts a new search in the
+existing resident process instead of starting a second session. The tray icon
+and its **Restore panel** menu action remain the way to restore a minimized
+result panel.
 
   On a desktop with **no system tray**, minimize still works but there is
   nowhere to retrieve the panel from. `KCIRCLE_LOG=debug` says so at startup;
@@ -256,11 +257,10 @@ The panel remembers its size and position across runs. It is written on a
 400 ms debounce after any resize rather than only when the panel closes, so a
 resize survives a crash or a kill.
 
-Clicking the **tray icon** starts a new search — the same gesture as pressing
-the shortcut. Right-click still raises the usual menu: **Restore panel**,
-**New search**, **Quit**. Restore lives there now on purpose, because with left
-click starting a search it is the only route back to a panel you did not mean
-to replace.
+Clicking the **tray icon** starts a fresh search in the resident process.
+Right-click still raises the usual menu: **Restore panel**, **New search**,
+**Quit**. Starting kcircle from the start menu or a global shortcut also starts
+a fresh search in that same resident process.
 
 Right-clicking the results gives the usual browser menu — Back, Forward,
 Reload, Copy, Copy link address, Save page, and open/save link in a new tab or
@@ -423,8 +423,13 @@ navigate), and `×`. The buttons along the bottom cycle **Shape**, **UA** and
 Bind a shortcut in *System Settings → Shortcuts → Custom Shortcuts*:
 
 ```
-Command: /path/to/kcircle/kcircle
+Command: /absolute/path/to/kcircle/kcircle
 ```
+
+Use the absolute path to the executable. Do not use only `kcircle` unless the
+checkout's launcher directory is on KDE's `PATH`; KDE custom shortcuts often
+run with a restricted environment. Every invocation sends a new-search request
+to the already-running tray process.
 
 ## Configuration
 
@@ -533,7 +538,7 @@ update-desktop-database ~/.local/share/applications
 Then bind a shortcut in *System Settings → Shortcuts → Custom Shortcuts*:
 
 ```
-Command: /path/to/kcircle/kcircle
+Command: /absolute/path/to/kcircle/kcircle
 ```
 
 After that, `git pull` in the checkout is all it takes to update the installed

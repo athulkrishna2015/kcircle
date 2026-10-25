@@ -2863,6 +2863,31 @@ def main():
     logg = setup_logging()
     translate_to = os.environ.get("KCIRCLE_TRANSLATE") or None
 
+    # Check for the resident process before doing any expensive startup work
+    # (notably the QtWebEngine health probe). A relaunch must hand off to the
+    # in-memory process immediately, even when its panel is in the tray.
+    _shm = QSharedMemory("kcircle-single-instance")
+    if _shm.attach():
+        _sock = QLocalSocket()
+        connected = False
+        _sock.connectToServer("kcircle-ipc")
+        for _ in range(10):
+            if _sock.waitForConnected(250):
+                connected = True
+                break
+            _sock.abort()
+            _sock.connectToServer("kcircle-ipc")
+        if connected:
+            _sock.write(b"new-search")
+            _sock.flush()
+            _sock.waitForBytesWritten(1000)
+        elif logg:
+            logg.error("resident kcircle found, but its IPC server did not respond")
+        _sock.disconnectFromServer()
+        _shm.detach()
+        sys.exit(0)
+    _shm.create(1)
+
     if HAVE_WEBENGINE and not webengine_is_healthy():
         logg.warning("QtWebEngine is installed but crashes on this system "
                      "(likely a PyQt6/Qt patch mismatch). Disabling the "
@@ -2871,21 +2896,6 @@ def main():
 
     logg.info("kcircle start (translate=%s, webengine=%s, settings=%s)",
               translate_to or "off", HAVE_WEBENGINE, load_settings())
-
-    # Single-instance: if another kcircle is already running, restore its
-    # existing session and exit immediately instead of starting a second copy.
-    _shm = QSharedMemory("kcircle-single-instance")
-    if _shm.attach():
-        _sock = QLocalSocket()
-        _sock.connectToServer("kcircle-ipc")
-        if _sock.waitForConnected(500):
-            _sock.write(b"restore")
-            _sock.flush()
-            _sock.waitForBytesWritten(500)
-        _sock.disconnectFromServer()
-        _shm.detach()
-        sys.exit(0)
-    _shm.create(1)
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -2921,12 +2931,12 @@ def main():
     tray_menu.addSeparator()
     tray_menu.addAction("Quit", app.quit)
     tray.setContextMenu(tray_menu)
-    # Tray clicks restore the resident session. New searches are explicit via
-    # the context menu, so relaunches and clicks never create sessions.
+    # A left or double tray click is the fast search gesture. Restoring an
+    # existing result remains available from the right-click menu.
     def on_tray_activated(reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger,
                       QSystemTrayIcon.ActivationReason.DoubleClick):
-            restore_panel()
+            begin_capture()
 
     tray.activated.connect(on_tray_activated)
     if QSystemTrayIcon.isSystemTrayAvailable():
@@ -2941,9 +2951,13 @@ def main():
     def begin_capture():
         """Hide the panel, freeze the screen, wait for a selection."""
         if state["overlay"] is not None:
-            # a selection is already in progress; don't stack overlays
-            state["overlay"].raise_()
-            return
+            # An external relaunch always means a new search. Replace an
+            # in-progress selection rather than silently reusing it.
+            old_overlay = state["overlay"]
+            state["overlay"] = None
+            old_overlay.close()
+            if logg:
+                logg.info("restarting the active selection from a relaunch")
         panel = state["panel"]
         if panel is not None:
             panel.hide()
@@ -3086,7 +3100,7 @@ def main():
         QTimer.singleShot(0, _focus)
         QTimer.singleShot(180, _focus)
 
-    # IPC server: a relaunch restores the running instance.
+    # IPC server: every relaunch starts a new search in the running instance.
     _srv = QLocalServer()
     _srv.removeServer("kcircle-ipc")
     _srv.listen("kcircle-ipc")
@@ -3095,8 +3109,7 @@ def main():
         if conn is None:
             return
         conn.waitForReadyRead(200)
-        conn.readAll()
-        QTimer.singleShot(0, restore_panel)
+        QTimer.singleShot(0, begin_capture)
         conn.disconnectFromServer()
     _srv.newConnection.connect(_on_ipc)
 
