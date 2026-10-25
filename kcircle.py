@@ -21,7 +21,9 @@ import sys
 import tempfile
 import time
 
-from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QSharedMemory, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+
 from PyQt6.QtGui import (
     QBrush,
     QColor,
@@ -2859,6 +2861,21 @@ def main():
     logg.info("kcircle start (translate=%s, webengine=%s, settings=%s)",
               translate_to or "off", HAVE_WEBENGINE, load_settings())
 
+    # Single-instance: if another kcircle is already running, ask it to come
+    # to the foreground and exit immediately instead of starting a second copy.
+    _shm = QSharedMemory("kcircle-single-instance")
+    if _shm.attach():
+        _sock = QLocalSocket()
+        _sock.connectToServer("kcircle-ipc")
+        if _sock.waitForConnected(500):
+            _sock.write(b"focus")
+            _sock.flush()
+            _sock.waitForBytesWritten(500)
+        _sock.disconnectFromServer()
+        _shm.detach()
+        sys.exit(0)
+    _shm.create(1)
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     state = {"panel": None, "overlay": None}
@@ -3054,6 +3071,20 @@ def main():
             ov.update()
         QTimer.singleShot(0, _focus)
         QTimer.singleShot(180, _focus)
+
+    # IPC server: a relaunch asks the running instance to start a new scan.
+    _srv = QLocalServer()
+    _srv.removeServer("kcircle-ipc")
+    _srv.listen("kcircle-ipc")
+    def _on_ipc():
+        conn = _srv.nextPendingConnection()
+        if conn is None:
+            return
+        conn.waitForReadyRead(200)
+        conn.readAll()
+        QTimer.singleShot(0, begin_capture)
+        conn.disconnectFromServer()
+    _srv.newConnection.connect(_on_ipc)
 
     QTimer.singleShot(60, begin_capture)
     sys.exit(app.exec())
