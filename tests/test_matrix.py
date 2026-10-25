@@ -739,6 +739,8 @@ def test_launching_always_captures():
           "a relaunch replaces an active selection instead of reusing it")
     check(src.index('if _shm.attach():') < src.index('webengine_is_healthy()'),
           "relaunch IPC is checked before the slow WebEngine probe")
+    check('stale instance marker; starting a new resident process' in src,
+          "a failed handoff falls through to cold startup")
     panel_start = src.index('def show_panel(')
     panel_end = src.index('old = state["panel"]', panel_start)
     check('webengine_is_healthy()' in src[panel_start:panel_end],

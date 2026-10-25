@@ -2959,12 +2959,20 @@ def main():
             _sock.write(b"new-search")
             _sock.flush()
             _sock.waitForBytesWritten(1000)
-        elif logg:
-            logg.error("resident kcircle found, but its IPC server did not respond")
+            _sock.disconnectFromServer()
+            _shm.detach()
+            sys.exit(0)
+        if logg:
+            logg.warning("stale instance marker; starting a new resident process")
         _sock.disconnectFromServer()
         _shm.detach()
-        sys.exit(0)
-    _shm.create(1)
+    if not _shm.create(1):
+        # A just-exited process may release the marker a moment later. Retry
+        # once rather than consuming the user's first shortcut press.
+        time.sleep(0.05)
+        if not _shm.create(1):
+            logg.error("could not claim the single-instance marker")
+            sys.exit(1)
     _start_relay_socket()
 
     logg.info("kcircle start (translate=%s, webengine=%s, settings=%s)",
