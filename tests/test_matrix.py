@@ -763,9 +763,10 @@ def test_capture_is_backgrounded():
     src = open("kcircle.py").read()
     begin = src.index("def begin_capture():")
     capture = src.index("capture_worker = CaptureWorker", begin)
-    show = src.index("ov.show()", begin)
-    check(show < capture,
-          "the scan overlay is shown before the screenshot worker starts")
+    ready = src.index("ov.set_shot(shot_path)", begin)
+    show = src.index("ov.show()", ready)
+    check(ready < show and src.index("ov.hide()", begin) < capture,
+          "the scan overlay stays hidden until the screenshot is ready")
     check("class CaptureWorker" in src,
           "screen capture runs on a worker thread")
     check("ov.set_shot(shot_path)" in src,

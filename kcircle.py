@@ -3062,6 +3062,11 @@ def main():
             shot = shot_path
             logg.info("captured scope=%s -> %s", scope, shot_path)
             ov.set_shot(shot_path)
+            # Do not cover the desktop while spectacle is capturing it. A
+            # visible fullscreen overlay would be captured as the black frame.
+            ov.show()
+            ov.raise_()
+            ov.activateWindow()
             if scope != "select":
                 state["overlay"] = None
                 ov.close()
@@ -3181,7 +3186,9 @@ def main():
         ov.picked.connect(on_pick)
         ov.copyOnly.connect(on_copy_only)
         ov.cancelled.connect(on_cancel)
-        ov.show()
+        # Keep the overlay hidden until the screenshot exists; otherwise the
+        # capture tool would record this window instead of the desktop.
+        ov.hide()
         # Esc must work even if KWin refuses us keyboard focus, so grab the key
         # at application level rather than relying on keyPressEvent
         esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), ov)
